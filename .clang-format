@@ -1,0 +1,27 @@
+---
+Language: C
+BasedOnStyle: LLVM
+IndentWidth: 2
+ColumnLimit: 80
+PointerAlignment: Right
+
+AlignConsecutiveAssignments:
+  Enabled: true
+  AcrossEmptyLines: false
+  AcrossComments: false
+
+AlignConsecutiveDeclarations:
+  Enabled: true
+
+AlignEscapedNewlines: Left
+AlignConsecutiveMacros: Consecutive
+AlignOperands: Align
+
+AlignAfterOpenBracket: Align
+
+AllowShortBlocksOnASingleLine: Empty
+AllowShortFunctionsOnASingleLine: None
+AllowShortIfStatementsOnASingleLine: Never
+BreakBeforeBraces: Attach
+SortIncludes: false
+SpaceBeforeParens: ControlStatements
