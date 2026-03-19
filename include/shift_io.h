@@ -34,8 +34,13 @@ typedef struct {
 } sio_read_buf_t;
 
 typedef struct {
-  const void *data; /* NULL means already submitted */
-  uint32_t    len;
+  int error; /* 0 = success; negative = errno-style error code */
+} sio_io_result_t;
+
+typedef struct {
+  const void *data;    /* original malloc'd pointer; app always frees this */
+  uint32_t    len;     /* total bytes to send */
+  uint32_t    offset;  /* bytes already sent; initialise to 0 */
 } sio_write_buf_t;
 
 /* --------------------------------------------------------------------------
@@ -46,12 +51,20 @@ typedef struct {
   shift_component_id_t fd;
   shift_component_id_t read_buf;
   shift_component_id_t write_buf;
+  shift_component_id_t io_result;
 } sio_component_ids_t;
 
 typedef struct {
-  shift_collection_id_t connected;
-  shift_collection_id_t reading;
-  shift_collection_id_t writing;
+  /* read_result_out: data arrived (error==0, len>0) or connection closed
+   *   (error==0 len==0 for EOF; error<0 for reset/error). App destroys entity
+   *   on close; moves to read_in after consuming data to re-arm recv. */
+  shift_collection_id_t read_result_out;
+  shift_collection_id_t read_in;          /* app done; next poll returns buf       */
+  shift_collection_id_t close_in;         /* app requests close; next poll closes  */
+  shift_collection_id_t write_in;         /* app deposits write jobs here          */
+  /* write_result_out: send done (error==0) or failed (error<0).
+   *   App must free write_buf.data and destroy entity in both cases. */
+  shift_collection_id_t write_result_out;
 } sio_collection_ids_t;
 
 /* --------------------------------------------------------------------------
@@ -62,9 +75,9 @@ typedef struct {
   shift_t *shift;
   uint32_t
       buf_count; /* number of pinned receive buffers (must be power of two) */
-  uint32_t buf_size;     /* size of each pinned receive buffer in bytes */
-  uint32_t max_fds;      /* maximum file descriptor value + 1 */
-  uint32_t ring_entries; /* io_uring queue depth */
+  uint32_t buf_size;        /* size of each pinned receive buffer in bytes */
+  uint32_t max_connections; /* maximum number of concurrent connections */
+  uint32_t ring_entries;    /* io_uring queue depth */
 } sio_config_t;
 
 /* --------------------------------------------------------------------------
@@ -82,9 +95,6 @@ void         sio_context_destroy(sio_context_t *ctx);
 
 sio_result_t sio_listen(sio_context_t *ctx, uint16_t port, int backlog);
 sio_result_t sio_poll(sio_context_t *ctx, uint32_t min_complete);
-sio_result_t sio_read_consume(sio_context_t *ctx, shift_entity_t entity);
-sio_result_t sio_write(sio_context_t *ctx, shift_entity_t entity,
-                       const void *data, uint32_t len);
 sio_result_t sio_disconnect(sio_context_t *ctx, shift_entity_t entity);
 
 const sio_component_ids_t  *sio_get_component_ids(const sio_context_t *ctx);

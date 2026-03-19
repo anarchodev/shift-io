@@ -17,27 +17,39 @@ static_assert(IO_URING_VERSION_MAJOR > 2 ||
  * Constants
  * -------------------------------------------------------------------------- */
 
-constexpr uint8_t SIO_OP_ACCEPT = 0;
-constexpr uint8_t SIO_OP_RECV   = 1;
-constexpr uint8_t SIO_OP_SEND   = 2;
-
 constexpr uint16_t SIO_BUF_GROUP_ID = 0;
 
 /* --------------------------------------------------------------------------
  * SQE user_data encoding
- * op in bits [39:32], fd in bits [31:0]
+ *
+ * ACCEPT:  SIO_UD_ACCEPT sentinel (UINT64_MAX — no entity)
+ * RECV:    bit63=0 | generation[30:0] in bits[62:32] | index in bits[31:0]
+ * SEND:    bit63=1 | generation[30:0] in bits[62:32] | index in bits[31:0]
+ *
+ * Generation is truncated to 31 bits; the top bit is used as the RECV/SEND
+ * discriminator. Wraparound requires 2^31 slot reuses between SQE and CQE —
+ * negligible in practice.
  * -------------------------------------------------------------------------- */
 
-static inline uint64_t sio_encode_ud(uint8_t op, int fd) {
-  return ((uint64_t)(uint8_t)op << 32) | (uint32_t)fd;
+#define SIO_UD_ACCEPT UINT64_MAX
+
+static inline uint64_t sio_encode_ud_recv(shift_entity_t e) {
+  return ((uint64_t)(e.generation & 0x7FFFFFFFu) << 32) | e.index;
 }
 
-static inline uint8_t sio_ud_op(uint64_t ud) {
-  return (uint8_t)(ud >> 32);
+static inline uint64_t sio_encode_ud_send(shift_entity_t e) {
+  return ((uint64_t)1 << 63) |
+         ((uint64_t)(e.generation & 0x7FFFFFFFu) << 32) | e.index;
 }
 
-static inline int sio_ud_fd(uint64_t ud) {
-  return (int)(uint32_t)ud;
+static inline bool sio_ud_is_accept(uint64_t ud) { return ud == UINT64_MAX; }
+static inline bool sio_ud_is_send(uint64_t ud)   { return (ud >> 63) & 1; }
+
+static inline shift_entity_t sio_ud_entity(uint64_t ud) {
+  return (shift_entity_t){
+      .index      = (uint32_t)ud,
+      .generation = (uint32_t)((ud >> 32) & 0x7FFFFFFFu),
+  };
 }
 
 /* --------------------------------------------------------------------------
@@ -48,8 +60,6 @@ typedef struct {
   shift_entity_t entity;
   bool           valid;
   bool           recv_armed;
-  const void    *pending_write_data; /* set by sio_write, cleared by sio_poll */
-  uint32_t       pending_write_len;
 } sio_fd_slot_t;
 
 /* --------------------------------------------------------------------------
@@ -64,9 +74,16 @@ struct sio_context {
   void                     *buf_base; /* malloc'd: buf_count * buf_size */
   uint32_t                  buf_count;
   uint32_t                  buf_size;
-  sio_fd_slot_t            *fd_table; /* indexed by fd value */
-  uint32_t                  max_fds;
+  sio_fd_slot_t            *fd_table; /* indexed by slot value */
+  uint32_t                  max_connections;
   int                       listen_fd; /* -1 if not listening */
   sio_component_ids_t       comp_ids;
-  sio_collection_ids_t      coll_ids;
+  sio_collection_ids_t      coll_ids;          /* app-facing; returned by sio_get_collection_ids */
+  shift_collection_id_t     coll_read_pending; /* internal: recv armed, waiting for data */
+  shift_collection_id_t     coll_write_pending;/* internal: send SQE submitted, waiting for CQE */
+  shift_collection_id_t     coll_write_retry;  /* internal: partial send, retried next poll */
+  /* Batched fixed-file slot releases — flushed at the top of sio_poll */
+  uint32_t                 *pending_releases;      /* slot indices, size max_connections */
+  uint32_t                  pending_release_count;
+  int                      *release_minus_one;     /* all-(-1) scratch, size max_connections */
 };
