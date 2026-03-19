@@ -15,11 +15,33 @@
 
 static sio_context_t *g_sio_ctx_for_destructor = NULL;
 
+static void sio_release_slot(sio_context_t *ctx, int slot);
+
+/* --------------------------------------------------------------------------
+ * fd component destructor
+ * Sole path for fixed-file slot release. Fires whenever a connection entity
+ * is destroyed — close_in, recv EOF/error, and app-side teardown all go
+ * through entity destruction.
+ * -------------------------------------------------------------------------- */
+
+static void fd_destructor(void *data, uint32_t count) {
+  sio_context_t *ctx = g_sio_ctx_for_destructor;
+  if (!ctx)
+    return;
+
+  sio_fd_t *fds = data;
+  for (uint32_t i = 0; i < count; i++) {
+    int fd = fds[i].fd;
+    if (fd < 0 || (uint32_t)fd >= ctx->max_connections)
+      continue;
+    sio_release_slot(ctx, fd);
+  }
+}
+
 /* --------------------------------------------------------------------------
  * read_buf component destructor
  * Returns any live io_uring provided buffer back to the kernel ring so that
- * buffers are never leaked when a connection entity is destroyed (e.g. on
- * sio_disconnect while the entity is in read_out).
+ * buffers are never leaked when a connection entity is destroyed.
  * -------------------------------------------------------------------------- */
 
 static void read_buf_destructor(void *data, uint32_t count) {
@@ -48,9 +70,12 @@ static void read_buf_destructor(void *data, uint32_t count) {
  * -------------------------------------------------------------------------- */
 
 static sio_result_t sio_arm_accept(sio_context_t *ctx);
-static sio_result_t sio_arm_recv(sio_context_t *ctx, int slot);
-static void         sio_release_slot(sio_context_t *ctx, int slot);
+static sio_result_t sio_arm_recv(sio_context_t *ctx, int slot, shift_entity_t entity);
+static bool         sio_arm_sends(sio_context_t *ctx, shift_collection_id_t coll_id);
+static void         sio_drain_close_in(sio_context_t *ctx);
+static void         sio_drain_read_in(sio_context_t *ctx);
 static void         sio_flush_releases(sio_context_t *ctx);
+static sio_result_t sio_submit_and_drain(sio_context_t *ctx, uint32_t min_complete);
 static sio_result_t sio_handle_accept_cqe(sio_context_t       *ctx,
                                           struct io_uring_cqe *cqe);
 static void sio_handle_recv_cqe(sio_context_t *ctx, struct io_uring_cqe *cqe);
@@ -81,15 +106,10 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
   ctx->listen_fd       = -1;
   sio_result_t err     = sio_error_oom; /* updated before each goto */
 
-  /* Allocate fd table */
-  ctx->fd_table = calloc(cfg->max_connections, sizeof(sio_fd_slot_t));
-  if (!ctx->fd_table)
-    goto cleanup_ctx;
-
   /* Allocate batched-release buffers */
   ctx->pending_releases = malloc(cfg->max_connections * sizeof(uint32_t));
   if (!ctx->pending_releases)
-    goto cleanup_fd_table;
+    goto cleanup_ctx;
 
   ctx->release_minus_one = malloc(cfg->max_connections * sizeof(int));
   if (!ctx->release_minus_one)
@@ -101,7 +121,7 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
   shift_component_info_t fd_info = {
       .element_size = sizeof(sio_fd_t),
       .constructor  = NULL,
-      .destructor   = NULL,
+      .destructor   = fd_destructor,
   };
   if (shift_component_register(ctx->shift, &fd_info, &ctx->comp_ids.fd) !=
       shift_ok)
@@ -308,8 +328,6 @@ cleanup_pending:
   ctx->release_minus_one = NULL;
   free(ctx->pending_releases);
   ctx->pending_releases = NULL;
-cleanup_fd_table:
-  free(ctx->fd_table);
 cleanup_ctx:
   free(ctx);
   return err;
@@ -345,7 +363,6 @@ void sio_context_destroy(sio_context_t *ctx) {
     ctx->ring_initialized = false;
   }
 
-  free(ctx->fd_table);
   free(ctx->pending_releases);
   free(ctx->release_minus_one);
   free(ctx);
@@ -369,13 +386,10 @@ static sio_result_t sio_arm_accept(sio_context_t *ctx) {
  * sio_arm_recv (static)
  * -------------------------------------------------------------------------- */
 
-static sio_result_t sio_arm_recv(sio_context_t *ctx, int slot) {
+static sio_result_t sio_arm_recv(sio_context_t *ctx, int slot,
+                                 shift_entity_t entity) {
   if (slot < 0 || (uint32_t)slot >= ctx->max_connections)
     return sio_error_invalid;
-
-  sio_fd_slot_t *s = &ctx->fd_table[slot];
-  if (s->recv_armed)
-    return sio_ok; /* already armed */
 
   struct io_uring_sqe *sqe = io_uring_get_sqe(&ctx->ring);
   if (!sqe)
@@ -384,9 +398,97 @@ static sio_result_t sio_arm_recv(sio_context_t *ctx, int slot) {
   io_uring_prep_recv(sqe, slot, NULL, 0, 0);
   sqe->flags |= IOSQE_FIXED_FILE | IOSQE_BUFFER_SELECT;
   sqe->buf_group = SIO_BUF_GROUP_ID;
-  io_uring_sqe_set_data64(sqe, sio_encode_ud_recv(s->entity));
-  s->recv_armed = true;
+  io_uring_sqe_set_data64(sqe, sio_encode_ud(entity));
   return sio_ok;
+}
+
+/* --------------------------------------------------------------------------
+ * sio_drain_close_in (static)
+ * Destroys every entity in close_in.  fd destructor queues slot release;
+ * read_buf destructor returns any held io_uring buffer.
+ * -------------------------------------------------------------------------- */
+
+static void sio_drain_close_in(sio_context_t *ctx) {
+  shift_entity_t *entities = NULL;
+  size_t          count    = 0;
+
+  shift_collection_get_entities(ctx->shift, ctx->coll_ids.close_in, &entities,
+                                &count);
+  for (size_t i = 0; i < count; i++)
+    shift_entity_destroy_one(ctx->shift, entities[i]);
+}
+
+/* --------------------------------------------------------------------------
+ * sio_drain_read_in (static)
+ * Returns each buffer to the io_uring ring, moves the connection entity back
+ * to read_pending, and re-arms recv.  Zeroing the read_buf component before
+ * the move prevents the read_buf destructor from double-returning the buffer
+ * if the entity is later destroyed while in read_pending.
+ * -------------------------------------------------------------------------- */
+
+static void sio_drain_read_in(sio_context_t *ctx) {
+  shift_entity_t *entities = NULL;
+  sio_fd_t       *fds      = NULL;
+  sio_read_buf_t *rbufs    = NULL;
+  size_t          count    = 0;
+
+  shift_collection_get_entities(ctx->shift, ctx->coll_ids.read_in, &entities,
+                                &count);
+  shift_collection_get_component_array(ctx->shift, ctx->coll_ids.read_in,
+                                       ctx->comp_ids.fd, (void **)&fds, NULL);
+  shift_collection_get_component_array(ctx->shift, ctx->coll_ids.read_in,
+                                       ctx->comp_ids.read_buf,
+                                       (void **)&rbufs, NULL);
+
+  for (size_t i = 0; i < count; i++) {
+    uint16_t buf_id = rbufs[i].buf_id;
+    void    *data   = (char *)ctx->buf_base + (size_t)buf_id * ctx->buf_size;
+
+    rbufs[i].data   = NULL;
+    rbufs[i].len    = 0;
+    rbufs[i].buf_id = 0;
+
+    io_uring_buf_ring_add(ctx->buf_ring, data, ctx->buf_size, buf_id,
+                          io_uring_buf_ring_mask(ctx->buf_count), (int)i);
+    shift_entity_move_one(ctx->shift, entities[i], ctx->coll_read_pending);
+    sio_arm_recv(ctx, fds[i].fd, entities[i]);
+  }
+  if (count > 0)
+    io_uring_buf_ring_advance(ctx->buf_ring, (int)count);
+}
+
+/* --------------------------------------------------------------------------
+ * sio_arm_sends (static)
+ * Arms send SQEs for all write entities in coll_id.  Returns true if every
+ * entity was armed, false if the SQ ring was exhausted mid-collection.
+ * Remaining entities stay in their collection and are retried next tick.
+ * -------------------------------------------------------------------------- */
+
+static bool sio_arm_sends(sio_context_t *ctx, shift_collection_id_t coll_id) {
+  shift_entity_t  *ents  = NULL;
+  sio_fd_t        *fds   = NULL;
+  sio_write_buf_t *wbufs = NULL;
+  size_t           count = 0;
+
+  shift_collection_get_entities(ctx->shift, coll_id, &ents, &count);
+  shift_collection_get_component_array(ctx->shift, coll_id, ctx->comp_ids.fd,
+                                       (void **)&fds, NULL);
+  shift_collection_get_component_array(ctx->shift, coll_id,
+                                       ctx->comp_ids.write_buf,
+                                       (void **)&wbufs, NULL);
+
+  for (size_t i = 0; i < count; i++) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ctx->ring);
+    if (!sqe)
+      return false;
+    io_uring_prep_send(sqe, fds[i].fd,
+                       (const char *)wbufs[i].data + wbufs[i].offset,
+                       wbufs[i].len - wbufs[i].offset, MSG_NOSIGNAL);
+    sqe->flags |= IOSQE_FIXED_FILE;
+    io_uring_sqe_set_data64(sqe, sio_encode_ud(ents[i]));
+    shift_entity_move_one(ctx->shift, ents[i], ctx->coll_write_pending);
+  }
+  return true;
 }
 
 /* --------------------------------------------------------------------------
@@ -518,12 +620,7 @@ static sio_result_t sio_handle_accept_cqe(sio_context_t       *ctx,
   }
   fd_comp->fd = new_slot;
 
-  /* Update fd_table and arm recv immediately — no need to wait for next tick */
-  sio_fd_slot_t *fd_slot = &ctx->fd_table[new_slot];
-  fd_slot->entity        = entity;
-  fd_slot->valid         = true;
-  fd_slot->recv_armed    = false;
-  sio_arm_recv(ctx, new_slot);
+  sio_arm_recv(ctx, new_slot, entity);
   return rearm_result;
 }
 
@@ -539,24 +636,12 @@ static void sio_handle_recv_cqe(sio_context_t *ctx, struct io_uring_cqe *cqe) {
   if (shift_entity_is_stale(ctx->shift, entity))
     return;
 
-  /* Recover fd from the entity's fd component */
-  sio_fd_t *fd_comp = NULL;
-  if (shift_entity_get_component(ctx->shift, entity, ctx->comp_ids.fd,
-                                 (void **)&fd_comp) != shift_ok)
-    return;
-
-  int            fd   = fd_comp->fd;
-  sio_fd_slot_t *slot = &ctx->fd_table[fd];
-  slot->recv_armed    = false; /* clear before any early return */
-
   int res = cqe->res;
 
   if (res > 0) {
     /* Verify the kernel selected a buffer — absence indicates a kernel bug or
      * misconfiguration; treat it as a fatal connection error. */
     if (!(cqe->flags & IORING_CQE_F_BUFFER)) {
-      sio_release_slot(ctx, fd);
-      slot->valid = false;
       shift_entity_destroy_one(ctx->shift, entity);
       return;
     }
@@ -572,8 +657,6 @@ static void sio_handle_recv_cqe(sio_context_t *ctx, struct io_uring_cqe *cqe) {
       io_uring_buf_ring_add(ctx->buf_ring, data, ctx->buf_size, buf_id,
                             io_uring_buf_ring_mask(ctx->buf_count), 0);
       io_uring_buf_ring_advance(ctx->buf_ring, 1);
-      sio_release_slot(ctx, fd);
-      slot->valid = false;
       shift_entity_destroy_one(ctx->shift, entity);
       return;
     }
@@ -585,12 +668,10 @@ static void sio_handle_recv_cqe(sio_context_t *ctx, struct io_uring_cqe *cqe) {
 
   } else if (res == 0 || (res != -ENOBUFS && res != -EINTR && res != -EAGAIN)) {
     /* EOF (res==0) or non-transient error — surface to app via read_result_out.
-     * The slot is already released; app must destroy the entity. */
+     * fd destructor queues slot release when app destroys the entity. */
     sio_io_result_t *ir = NULL;
     shift_entity_get_component(ctx->shift, entity, ctx->comp_ids.io_result,
                                (void **)&ir);
-    sio_release_slot(ctx, fd);
-    slot->valid = false;
     if (ir) {
       ir->error = res; /* 0 = EOF, negative = errno */
       shift_entity_move_one(ctx->shift, entity, ctx->coll_ids.read_result_out);
@@ -598,8 +679,7 @@ static void sio_handle_recv_cqe(sio_context_t *ctx, struct io_uring_cqe *cqe) {
       shift_entity_destroy_one(ctx->shift, entity); /* unexpected fallback */
     }
   }
-  /* -ENOBUFS/-EINTR/-EAGAIN: transient; recv_armed cleared, re-arms next tick
-   */
+  /* -ENOBUFS/-EINTR/-EAGAIN: transient; entity stays in read_pending. */
 }
 
 /* --------------------------------------------------------------------------
@@ -653,6 +733,43 @@ static void sio_handle_send_cqe(sio_context_t *ctx, struct io_uring_cqe *cqe) {
 }
 
 /* --------------------------------------------------------------------------
+ * sio_submit_and_drain (static)
+ * Submits pending SQEs and waits for at least min_complete CQEs, then
+ * dispatches each CQE to the appropriate handler and advances the CQ head.
+ * -------------------------------------------------------------------------- */
+
+static sio_result_t sio_submit_and_drain(sio_context_t *ctx,
+                                         uint32_t       min_complete) {
+  int ret = io_uring_submit_and_wait(&ctx->ring, (unsigned)min_complete);
+  if (ret < 0 && ret != -EINTR)
+    return sio_error_io;
+
+  struct io_uring_cqe *cqe;
+  unsigned             head;
+  uint32_t             count  = 0;
+  sio_result_t         result = sio_ok;
+
+  io_uring_for_each_cqe(&ctx->ring, head, cqe) {
+    uint64_t ud = io_uring_cqe_get_data64(cqe);
+    if (sio_ud_is_accept(ud)) {
+      if (sio_handle_accept_cqe(ctx, cqe) != sio_ok)
+        result = sio_error_io;
+    } else {
+      shift_entity_t entity = sio_ud_entity(ud);
+      if (!shift_entity_is_stale(ctx->shift, entity) &&
+          ctx->shift->metadata[entity.index].col_id == ctx->coll_write_pending)
+        sio_handle_send_cqe(ctx, cqe);
+      else
+        sio_handle_recv_cqe(ctx, cqe);
+    }
+    count++;
+  }
+
+  io_uring_cq_advance(&ctx->ring, count);
+  return result;
+}
+
+/* --------------------------------------------------------------------------
  * sio_poll
  * -------------------------------------------------------------------------- */
 
@@ -660,178 +777,38 @@ sio_result_t sio_poll(sio_context_t *ctx, uint32_t min_complete) {
   if (!ctx)
     return sio_error_null;
 
-  /* Step 0a: flush batched slot releases from the previous tick.
-   * Done before close_in drain so that any slots released by sio_disconnect
-   * between ticks are flushed before we queue new ones from close_in. */
+  /* Step 0: drain close_in — destroy each entity flagged for teardown.
+   * Done before read_in so we never re-arm a recv for a closing fd. */
+  sio_drain_close_in(ctx);
+
+  /* Step 1: flush batched slot releases queued by close_in and any entity
+   * destructions from the previous tick. */
   sio_flush_releases(ctx);
 
-  /* Step 0b: drain close_in — close fd and destroy entity for each connection
-   * the app has flagged for teardown. Done before read_in drain and recv-arm
-   * so we never try to re-arm a recv for a fd we are about to close. */
-  {
-    shift_entity_t *cl_entities = NULL;
-    sio_fd_t       *cl_fds      = NULL;
-    size_t          cl_count    = 0;
-
-    shift_collection_get_entities(ctx->shift, ctx->coll_ids.close_in,
-                                  &cl_entities, &cl_count);
-    shift_collection_get_component_array(ctx->shift, ctx->coll_ids.close_in,
-                                         ctx->comp_ids.fd, (void **)&cl_fds,
-                                         NULL);
-
-    for (size_t i = 0; i < cl_count; i++) {
-      int fd = cl_fds[i].fd;
-      sio_release_slot(ctx, fd);
-      if (fd >= 0 && (uint32_t)fd < ctx->max_connections) {
-        ctx->fd_table[fd].valid      = false;
-        ctx->fd_table[fd].recv_armed = false;
-      }
-      /* read_buf destructor returns any live io_uring buffer automatically */
-      shift_entity_destroy_one(ctx->shift, cl_entities[i]);
-    }
-
-    /* Flush releases queued by close_in drain before arming new recvs */
-    sio_flush_releases(ctx);
-  }
-
-  /* Step 1: drain read_in — return buffers to ring, move back to read_pending,
+  /* Step 2: drain read_in — return buffers to ring, move back to read_pending,
    * and re-arm recv immediately (avoids a full read_pending scan each tick). */
-  {
-    shift_entity_t *centities = NULL;
-    sio_fd_t       *cfds      = NULL;
-    sio_read_buf_t *crbufs    = NULL;
-    size_t          ccount    = 0;
-
-    shift_collection_get_entities(ctx->shift, ctx->coll_ids.read_in, &centities,
-                                  &ccount);
-    shift_collection_get_component_array(ctx->shift, ctx->coll_ids.read_in,
-                                         ctx->comp_ids.fd, (void **)&cfds,
-                                         NULL);
-    shift_collection_get_component_array(ctx->shift, ctx->coll_ids.read_in,
-                                         ctx->comp_ids.read_buf,
-                                         (void **)&crbufs, NULL);
-
-    for (size_t i = 0; i < ccount; i++) {
-      uint16_t buf_id = crbufs[i].buf_id;
-      void    *data   = (char *)ctx->buf_base + (size_t)buf_id * ctx->buf_size;
-
-      /* Zero the component so the read_buf destructor skips it if the entity
-       * is later destroyed in read_pending (e.g. on disconnect). */
-      crbufs[i].data   = NULL;
-      crbufs[i].len    = 0;
-      crbufs[i].buf_id = 0;
-
-      io_uring_buf_ring_add(ctx->buf_ring, data, ctx->buf_size, buf_id,
-                            io_uring_buf_ring_mask(ctx->buf_count), (int)i);
-      shift_entity_move_one(ctx->shift, centities[i], ctx->coll_read_pending);
-      sio_arm_recv(ctx, cfds[i].fd);
-    }
-    if (ccount > 0)
-      io_uring_buf_ring_advance(ctx->buf_ring, (int)ccount);
-  }
-
-  /* Step 2 eliminated: recv is armed on accept and on read_in drain above,
-   * so there is no need to scan read_pending every tick. */
+  sio_drain_read_in(ctx);
 
   /* Step 3: arm sends — drain write_retry first (partial sends from last tick),
    * then write_in (new sends from the app).  Retry entities already have offset
    * set; new entities have offset == 0.  Both use data+offset / len-offset.
    * If the SQ ring is full, remaining entities stay in their collection. */
-  {
-    /* Helper lambda via compound-literal: arm one collection of write entities
-     */
-#define SIO_ARM_SENDS(coll_id)                                               \
-  do {                                                                       \
-    shift_entity_t  *_ents  = NULL;                                          \
-    sio_fd_t        *_fds   = NULL;                                          \
-    sio_write_buf_t *_wbufs = NULL;                                          \
-    size_t           _count = 0;                                             \
-    shift_collection_get_entities(ctx->shift, (coll_id), &_ents, &_count);   \
-    shift_collection_get_component_array(                                    \
-        ctx->shift, (coll_id), ctx->comp_ids.fd, (void **)&_fds, NULL);      \
-    shift_collection_get_component_array(ctx->shift, (coll_id),              \
-                                         ctx->comp_ids.write_buf,            \
-                                         (void **)&_wbufs, NULL);            \
-    for (size_t _i = 0; _i < _count; _i++) {                                 \
-      struct io_uring_sqe *_sqe = io_uring_get_sqe(&ctx->ring);              \
-      if (!_sqe)                                                             \
-        goto send_ring_full;                                                 \
-      io_uring_prep_send(_sqe, _fds[_i].fd,                                  \
-                         (const char *)_wbufs[_i].data + _wbufs[_i].offset,  \
-                         _wbufs[_i].len - _wbufs[_i].offset, MSG_NOSIGNAL);  \
-      _sqe->flags |= IOSQE_FIXED_FILE;                                       \
-      io_uring_sqe_set_data64(_sqe, sio_encode_ud_send(_ents[_i]));          \
-      shift_entity_move_one(ctx->shift, _ents[_i], ctx->coll_write_pending); \
-    }                                                                        \
-  } while (0)
+  if (sio_arm_sends(ctx, ctx->coll_write_retry))
+    sio_arm_sends(ctx, ctx->coll_ids.write_in);
 
-    SIO_ARM_SENDS(ctx->coll_write_retry);
-    SIO_ARM_SENDS(ctx->coll_ids.write_in);
-  send_ring_full:;
-#undef SIO_ARM_SENDS
-  }
+  /* Step 4: commit all deferred moves so col_id is current before waiting.
+   * This ensures CQE dispatch can use collection membership to distinguish
+   * send (write_pending) from recv (read_pending) without a discriminator. */
+  shift_flush(ctx->shift);
 
-  /* Step 4: submit and wait */
-  int ret = io_uring_submit_and_wait(&ctx->ring, (unsigned)min_complete);
-  if (ret < 0 && ret != -EINTR)
-    return sio_error_io;
+  /* Steps 5-7: submit SQEs, wait for CQEs, dispatch handlers, advance CQ. */
+  sio_result_t poll_result = sio_submit_and_drain(ctx, min_complete);
 
-  /* Step 5: drain CQEs */
-  struct io_uring_cqe *cqe;
-  unsigned             head;
-  uint32_t             cqe_count   = 0;
-  sio_result_t         poll_result = sio_ok;
-
-  io_uring_for_each_cqe(&ctx->ring, head, cqe) {
-    uint64_t ud = io_uring_cqe_get_data64(cqe);
-    if (sio_ud_is_accept(ud)) {
-      if (sio_handle_accept_cqe(ctx, cqe) != sio_ok)
-        poll_result = sio_error_io;
-    } else if (sio_ud_is_send(ud))
-      sio_handle_send_cqe(ctx, cqe);
-    else
-      sio_handle_recv_cqe(ctx, cqe);
-    cqe_count++;
-  }
-
-  /* Step 6: advance CQ head */
-  io_uring_cq_advance(&ctx->ring, cqe_count);
-
-  /* Step 7: commit all deferred entity moves queued during this tick.
+  /* Step 8: commit deferred entity moves queued during CQE processing.
    * The app receives a consistent view of collections on return. */
   shift_flush(ctx->shift);
 
   return poll_result;
-}
-
-/* --------------------------------------------------------------------------
- * sio_disconnect
- * -------------------------------------------------------------------------- */
-
-sio_result_t sio_disconnect(sio_context_t *ctx, shift_entity_t entity) {
-  if (!ctx)
-    return sio_error_null;
-
-  if (shift_entity_is_stale(ctx->shift, entity))
-    return sio_error_stale;
-
-  sio_fd_t *fd_comp = NULL;
-  if (shift_entity_get_component(ctx->shift, entity, ctx->comp_ids.fd,
-                                 (void **)&fd_comp) != shift_ok)
-    return sio_error_invalid;
-
-  int fd = fd_comp->fd;
-
-  sio_release_slot(ctx, fd);
-
-  if (fd >= 0 && (uint32_t)fd < ctx->max_connections) {
-    ctx->fd_table[fd].valid = false;
-  }
-
-  /* Destroying the entity triggers read_buf_destructor, which returns any live
-   * io_uring provided buffer back to the kernel ring automatically. */
-  shift_entity_destroy_one(ctx->shift, entity);
-  return sio_ok;
 }
 
 /* --------------------------------------------------------------------------

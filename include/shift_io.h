@@ -16,8 +16,7 @@ constexpr sio_result_t sio_error_null    = -1;
 constexpr sio_result_t sio_error_oom     = -2;
 constexpr sio_result_t sio_error_invalid = -3;
 constexpr sio_result_t sio_error_io      = -4;
-constexpr sio_result_t sio_error_stale   = -5;
-constexpr sio_result_t sio_error_no_sqe  = -6;
+constexpr sio_result_t sio_error_no_sqe  = -5;
 
 /* --------------------------------------------------------------------------
  * Component types
@@ -95,7 +94,6 @@ void         sio_context_destroy(sio_context_t *ctx);
 
 sio_result_t sio_listen(sio_context_t *ctx, uint16_t port, int backlog);
 sio_result_t sio_poll(sio_context_t *ctx, uint32_t min_complete);
-sio_result_t sio_disconnect(sio_context_t *ctx, shift_entity_t entity);
 
 const sio_component_ids_t  *sio_get_component_ids(const sio_context_t *ctx);
 const sio_collection_ids_t *sio_get_collection_ids(const sio_context_t *ctx);
