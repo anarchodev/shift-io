@@ -756,8 +756,10 @@ static sio_result_t sio_submit_and_drain(sio_context_t *ctx,
         result = sio_error_io;
     } else {
       shift_entity_t entity = sio_ud_entity(ud);
+      shift_collection_id_t col_id;
+      shift_entity_get_collection(ctx->shift, entity, &col_id);
       if (!shift_entity_is_stale(ctx->shift, entity) &&
-          ctx->shift->metadata[entity.index].col_id == ctx->coll_write_pending)
+          col_id == ctx->coll_write_pending)
         sio_handle_send_cqe(ctx, cqe);
       else
         sio_handle_recv_cqe(ctx, cqe);
