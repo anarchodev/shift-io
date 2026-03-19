@@ -65,6 +65,12 @@ static void read_buf_destructor(void *data, uint32_t count) {
     io_uring_buf_ring_advance(ctx->buf_ring, n);
 }
 
+static void user_data_constructor(void *data, uint32_t count) {
+  sio_user_data_t *uds = data;
+  for (uint32_t i = 0; i < count; i++)
+    uds[i].value = UINT64_MAX;
+}
+
 /* --------------------------------------------------------------------------
  * Forward declarations of static helpers
  * -------------------------------------------------------------------------- */
@@ -156,12 +162,22 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
                                &ctx->comp_ids.io_result) != shift_ok)
     goto cleanup_pending;
 
-  /* Register read collections — all carry {fd, read_buf, io_result} */
+  shift_component_info_t ud_info = {
+      .element_size = sizeof(sio_user_data_t),
+      .constructor  = user_data_constructor,
+      .destructor   = NULL,
+  };
+  if (shift_component_register(ctx->shift, &ud_info,
+                               &ctx->comp_ids.user_data) != shift_ok)
+    goto cleanup_pending;
+
+  /* Register read collections — all carry {fd, read_buf, io_result, user_data} */
   shift_component_id_t read_pending_comps[] = {
-      ctx->comp_ids.fd, ctx->comp_ids.read_buf, ctx->comp_ids.io_result};
+      ctx->comp_ids.fd, ctx->comp_ids.read_buf, ctx->comp_ids.io_result,
+      ctx->comp_ids.user_data};
   shift_collection_info_t read_pending_info = {
       .comp_ids     = read_pending_comps,
-      .comp_count   = 3,
+      .comp_count   = 4,
       .max_capacity = 0,
       .on_enter     = NULL,
       .on_leave     = NULL,
@@ -171,10 +187,11 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
     goto cleanup_pending;
 
   shift_component_id_t read_result_out_comps[] = {
-      ctx->comp_ids.fd, ctx->comp_ids.read_buf, ctx->comp_ids.io_result};
+      ctx->comp_ids.fd, ctx->comp_ids.read_buf, ctx->comp_ids.io_result,
+      ctx->comp_ids.user_data};
   shift_collection_info_t read_result_out_info = {
       .comp_ids     = read_result_out_comps,
-      .comp_count   = 3,
+      .comp_count   = 4,
       .max_capacity = 0,
       .on_enter     = NULL,
       .on_leave     = NULL,
@@ -184,10 +201,11 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
     goto cleanup_pending;
 
   shift_component_id_t read_in_comps[] = {
-      ctx->comp_ids.fd, ctx->comp_ids.read_buf, ctx->comp_ids.io_result};
+      ctx->comp_ids.fd, ctx->comp_ids.read_buf, ctx->comp_ids.io_result,
+      ctx->comp_ids.user_data};
   shift_collection_info_t read_in_info = {
       .comp_ids     = read_in_comps,
-      .comp_count   = 3,
+      .comp_count   = 4,
       .max_capacity = 0,
       .on_enter     = NULL,
       .on_leave     = NULL,
@@ -197,10 +215,11 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
     goto cleanup_pending;
 
   shift_component_id_t close_in_comps[] = {
-      ctx->comp_ids.fd, ctx->comp_ids.read_buf, ctx->comp_ids.io_result};
+      ctx->comp_ids.fd, ctx->comp_ids.read_buf, ctx->comp_ids.io_result,
+      ctx->comp_ids.user_data};
   shift_collection_info_t close_in_info = {
       .comp_ids     = close_in_comps,
-      .comp_count   = 3,
+      .comp_count   = 4,
       .max_capacity = 0,
       .on_enter     = NULL,
       .on_leave     = NULL,
@@ -209,7 +228,7 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
                                 &ctx->coll_ids.close_in) != shift_ok)
     goto cleanup_pending;
 
-  /* Register write collections — all carry {fd, write_buf, io_result}.
+  /* Register write collections — all carry {fd, write_buf, io_result, user_data}.
    * write_in:          app deposits write jobs here; sio_poll arms the send.
    * write_pending:     send SQE submitted; waiting for CQE.
    * write_result_out:  send done or failed; app checks io_result.error,
@@ -217,11 +236,12 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
    * write_retry:       partial send; library retries on next poll (internal).
    */
   shift_component_id_t write_comps[] = {
-      ctx->comp_ids.fd, ctx->comp_ids.write_buf, ctx->comp_ids.io_result};
+      ctx->comp_ids.fd, ctx->comp_ids.write_buf, ctx->comp_ids.io_result,
+      ctx->comp_ids.user_data};
 
   shift_collection_info_t write_in_info = {
       .comp_ids     = write_comps,
-      .comp_count   = 3,
+      .comp_count   = 4,
       .max_capacity = 0,
       .on_enter     = NULL,
       .on_leave     = NULL,
@@ -232,7 +252,7 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
 
   shift_collection_info_t write_pending_info = {
       .comp_ids     = write_comps,
-      .comp_count   = 3,
+      .comp_count   = 4,
       .max_capacity = 0,
       .on_enter     = NULL,
       .on_leave     = NULL,
@@ -243,7 +263,7 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
 
   shift_collection_info_t write_result_out_info = {
       .comp_ids     = write_comps,
-      .comp_count   = 3,
+      .comp_count   = 4,
       .max_capacity = 0,
       .on_enter     = NULL,
       .on_leave     = NULL,
@@ -254,7 +274,7 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
 
   shift_collection_info_t write_retry_info = {
       .comp_ids     = write_comps,
-      .comp_count   = 3,
+      .comp_count   = 4,
       .max_capacity = 0,
       .on_enter     = NULL,
       .on_leave     = NULL,

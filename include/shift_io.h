@@ -37,6 +37,10 @@ typedef struct {
 } sio_io_result_t;
 
 typedef struct {
+  uint64_t value;
+} sio_user_data_t;
+
+typedef struct {
   const void *data;    /* original malloc'd pointer; app always frees this */
   uint32_t    len;     /* total bytes to send */
   uint32_t    offset;  /* bytes already sent; initialise to 0 */
@@ -51,6 +55,7 @@ typedef struct {
   shift_component_id_t read_buf;
   shift_component_id_t write_buf;
   shift_component_id_t io_result;
+  shift_component_id_t user_data;
 } sio_component_ids_t;
 
 typedef struct {
