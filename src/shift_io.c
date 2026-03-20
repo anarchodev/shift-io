@@ -434,8 +434,8 @@ static void sio_drain_close_in(sio_context_t *ctx) {
 
   shift_collection_get_entities(ctx->shift, ctx->coll_ids.close_in, &entities,
                                 &count);
-  for (size_t i = 0; i < count; i++)
-    shift_entity_destroy_one(ctx->shift, entities[i]);
+  if (count > 0)
+    shift_entity_destroy(ctx->shift, entities, (uint32_t)count);
 }
 
 /* --------------------------------------------------------------------------
@@ -470,11 +470,12 @@ static void sio_drain_read_in(sio_context_t *ctx) {
 
     io_uring_buf_ring_add(ctx->buf_ring, data, ctx->buf_size, buf_id,
                           io_uring_buf_ring_mask(ctx->buf_count), (int)i);
-    shift_entity_move_one(ctx->shift, entities[i], ctx->coll_read_pending);
     sio_arm_recv(ctx, fds[i].fd, entities[i]);
   }
-  if (count > 0)
+  if (count > 0) {
     io_uring_buf_ring_advance(ctx->buf_ring, (int)count);
+    shift_entity_move(ctx->shift, entities, (uint32_t)count, ctx->coll_read_pending);
+  }
 }
 
 /* --------------------------------------------------------------------------
@@ -624,13 +625,13 @@ static sio_result_t sio_handle_accept_cqe(sio_context_t       *ctx,
 
   /* Create entity in read_pending */
   shift_entity_t entity;
-  if (shift_entity_create_one(ctx->shift, ctx->coll_read_pending, &entity) !=
+  if (shift_entity_create_one_immediate(ctx->shift, ctx->coll_read_pending, &entity) !=
       shift_ok) {
     sio_release_slot(ctx, new_slot);
     return rearm_result;
   }
 
-  /* Set fd component (create is eager, so the entity is already placed) */
+  /* Set fd component (_immediate placement — entity is live now) */
   sio_fd_t *fd_comp = NULL;
   if (shift_entity_get_component(ctx->shift, entity, ctx->comp_ids.fd,
                                  (void **)&fd_comp) != shift_ok) {

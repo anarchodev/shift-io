@@ -79,24 +79,8 @@ int main(void) {
    * It uses the same {fd, write_buf} components as write_in so that entities
    * can be moved from echo_pending directly into write_in.
    */
-  shift_collection_id_t echo_pending_coll;
-  {
-    shift_component_id_t    ep_comps[] = {comp_ids->fd, comp_ids->write_buf,
-                                          comp_ids->io_result};
-    shift_collection_info_t ep_info    = {
-           .comp_ids     = ep_comps,
-           .comp_count   = 3,
-           .max_capacity = 0,
-           .on_enter     = NULL,
-           .on_leave     = NULL,
-    };
-    if (shift_collection_register(sh, &ep_info, &echo_pending_coll) != shift_ok) {
-      fprintf(stderr, "failed to register echo_pending collection\n");
-      sio_context_destroy(ctx);
-      shift_context_destroy(sh);
-      return 1;
-    }
-  }
+  SHIFT_COLLECTION(sh, echo_pending_coll, comp_ids->fd, comp_ids->write_buf,
+                   comp_ids->io_result);
 
   if (sio_listen(ctx, PORT, BACKLOG) != sio_ok) {
     fprintf(stderr, "sio_listen failed on port %d\n", PORT);
@@ -156,9 +140,9 @@ int main(void) {
           continue;
         }
 
-        /* Create a write entity in echo_pending (eager placement). */
+        /* Create a write entity in echo_pending (_immediate placement). */
         shift_entity_t ep_entity;
-        if (shift_entity_create_one(sh, echo_pending_coll, &ep_entity) !=
+        if (shift_entity_create_one_immediate(sh, echo_pending_coll, &ep_entity) !=
             shift_ok) {
           /* OOM — drop this connection's reply; move to read_in to re-arm. */
           shift_entity_move_one(sh, ro_entities[i], coll_ids->read_in);
@@ -195,8 +179,8 @@ int main(void) {
     /* ------------------------------------------------------------------ */
     /* Process echo_pending: move ready write jobs into write_in.         */
     /*                                                                    */
-    /* echo_pending entities were created eagerly above and are visible   */
-    /* in the collection immediately (before shift_flush).                */
+    /* echo_pending entities were created with _immediate above and are   */
+    /* visible in the collection before shift_flush.                      */
     /* ------------------------------------------------------------------ */
     {
       shift_entity_t  *ep_entities = NULL;
