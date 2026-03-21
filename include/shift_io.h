@@ -46,6 +46,14 @@ typedef struct {
   uint32_t    offset;  /* bytes already sent; initialise to 0 */
 } sio_write_buf_t;
 
+typedef struct {
+  shift_entity_t entity; /* handle to internal connections entity */
+} sio_conn_entity_t;
+
+typedef struct {
+  shift_entity_t entity; /* handle to user's connection_results entity */
+} sio_user_conn_entity_t;
+
 /* --------------------------------------------------------------------------
  * Registered IDs
  * -------------------------------------------------------------------------- */
@@ -56,19 +64,14 @@ typedef struct {
   shift_component_id_t write_buf;
   shift_component_id_t io_result;
   shift_component_id_t user_data;
+  shift_component_id_t conn_entity;      /* sio_conn_entity_t */
+  shift_component_id_t user_conn_entity; /* sio_user_conn_entity_t */
 } sio_component_ids_t;
 
 typedef struct {
-  /* read_result_out: data arrived (error==0, len>0) or connection closed
-   *   (error==0 len==0 for EOF; error<0 for reset/error). App destroys entity
-   *   on close; moves to read_in after consuming data to re-arm recv. */
-  shift_collection_id_t read_result_out;
-  shift_collection_id_t read_in;          /* app done; next poll returns buf       */
-  shift_collection_id_t close_in;         /* app requests close; next poll closes  */
-  shift_collection_id_t write_in;         /* app deposits write jobs here          */
-  /* write_result_out: send done (error==0) or failed (error<0).
-   *   App must free write_buf.data and destroy entity in both cases. */
-  shift_collection_id_t write_result_out;
+  shift_collection_id_t connections; /* user destroys entities here to close   */
+  shift_collection_id_t read_in;     /* user moves consumed reads here         */
+  shift_collection_id_t write_in;    /* user creates write entities here       */
 } sio_collection_ids_t;
 
 /* --------------------------------------------------------------------------
@@ -77,11 +80,25 @@ typedef struct {
 
 typedef struct {
   shift_t *shift;
+  sio_component_ids_t comp_ids; /* from sio_register_components */
   uint32_t
       buf_count; /* number of pinned receive buffers (must be power of two) */
   uint32_t buf_size;        /* size of each pinned receive buffer in bytes */
   uint32_t max_connections; /* maximum number of concurrent connections */
   uint32_t ring_entries;    /* io_uring queue depth */
+  /* User-provided result collections.  Each must carry at least the required
+   * sio components (validated at context creation via introspection).
+   *   connection_results: >= {fd, user_data}
+   *   read_results:       >= {fd, read_buf, io_result, user_data,
+   *                            conn_entity, user_conn_entity}
+   *   write_results:      >= {fd, write_buf, io_result, user_data,
+   *                            conn_entity, user_conn_entity}           */
+  shift_collection_id_t connection_results;
+  shift_collection_id_t read_results;
+  shift_collection_id_t write_results;
+  /* When true, the library destroys the user's connection_results entity
+   * automatically when the connection disconnects (EOF or error). */
+  bool auto_destroy_user_entity;
 } sio_config_t;
 
 /* --------------------------------------------------------------------------
@@ -93,6 +110,12 @@ typedef struct sio_context sio_context_t;
 /* --------------------------------------------------------------------------
  * Public API
  * -------------------------------------------------------------------------- */
+
+/* Register all sio component types on the given shift context.  Call this
+ * BEFORE creating user collections so that the returned component IDs can be
+ * used in collection registration.  The same IDs must be passed to
+ * sio_context_create via sio_config_t::comp_ids. */
+sio_result_t sio_register_components(shift_t *sh, sio_component_ids_t *out);
 
 sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out);
 void         sio_context_destroy(sio_context_t *ctx);

@@ -49,6 +49,12 @@ static inline shift_entity_t sio_ud_entity(uint64_t ud) {
  * Internal context
  * -------------------------------------------------------------------------- */
 
+/* Internal-only component: stored on connections entities to track the
+ * associated read-cycle entity for cleanup in the on_leave callback. */
+typedef struct {
+  shift_entity_t entity;
+} sio_read_cycle_entity_t;
+
 struct sio_context {
   shift_t                  *shift;
   struct io_uring           ring;
@@ -60,10 +66,18 @@ struct sio_context {
   uint32_t                  max_connections;
   int                       listen_fd; /* -1 if not listening */
   sio_component_ids_t       comp_ids;
-  sio_collection_ids_t      coll_ids;          /* app-facing; returned by sio_get_collection_ids */
-  shift_collection_id_t     coll_read_pending; /* internal: recv armed, waiting for data */
-  shift_collection_id_t     coll_write_pending;/* internal: send SQE submitted, waiting for CQE */
-  shift_collection_id_t     coll_write_retry;  /* internal: partial send, retried next poll */
+  sio_collection_ids_t      coll_ids;  /* connections, read_in, write_in */
+  /* Internal-only component ID for read_cycle_entity on connections */
+  shift_component_id_t      comp_read_cycle_entity;
+  /* User-provided result collections */
+  shift_collection_id_t     coll_connection_results;
+  shift_collection_id_t     coll_read_results;
+  shift_collection_id_t     coll_write_results;
+  /* Internal collections */
+  shift_collection_id_t     coll_read_pending; /* recv armed, waiting for data */
+  shift_collection_id_t     coll_write_pending;/* send SQE submitted, waiting for CQE */
+  shift_collection_id_t     coll_write_retry;  /* partial send, retried next poll */
+  bool                      auto_destroy_user_entity;
   /* Batched fixed-file slot releases — flushed at the top of sio_poll */
   uint32_t                 *pending_releases;      /* slot indices, size max_connections */
   uint32_t                  pending_release_count;

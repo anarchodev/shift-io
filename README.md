@@ -4,35 +4,270 @@ A C23 TCP networking library built on [shift](https://github.com/anarchodev/shif
 
 ## Overview
 
-`shift-io` maps TCP connections to shift entities and drives them through named collections as I/O events arrive. Application code never touches sockets or io_uring directly — it iterates SoA arrays from shift collections and calls a small set of functions to consume reads and queue writes.
+`shift-io` maps TCP connections to shift entities and drives them through collections as I/O events arrive. Application code never touches sockets or io_uring directly — it iterates SoA arrays from shift collections and moves entities between collections to drive the I/O lifecycle.
 
-**Collections:**
+The user provides their own result collections for connections, reads, and writes. These collections must carry at least the required sio components but may include additional application-specific components. This lets the application attach custom state directly to I/O entities without external lookup tables.
 
-| Collection | Components | Meaning |
-|------------|------------|---------|
-| `connected` | `fd` | Connection established, recv armed |
-| `reading` | `fd`, `read_buf` | Data has arrived, waiting for the application to consume it |
-| `writing` | `fd`, `write_buf` | Application has queued a send, waiting for io_uring to complete it |
+## Setup
 
-**Lifecycle of a connection:**
+Construction is two-phase so that component IDs are available before collections are created:
+
+```c
+/* Phase 1: register sio component types */
+sio_component_ids_t comp_ids;
+sio_register_components(sh, &comp_ids);
+
+/* Phase 2: create user-owned result collections using sio component IDs */
+SHIFT_COLLECTION(sh, my_read_results,
+                 comp_ids.fd, comp_ids.read_buf, comp_ids.io_result,
+                 comp_ids.user_data, comp_ids.conn_entity,
+                 comp_ids.user_conn_entity);
+
+/* Phase 3: create sio context */
+sio_config_t cfg = {
+    .shift              = sh,
+    .comp_ids           = comp_ids,
+    .buf_count          = 64,
+    .buf_size           = 4096,
+    .max_connections    = 4096,
+    .ring_entries       = 256,
+    .connection_results = my_connection_results,
+    .read_results       = my_read_results,
+    .write_results      = my_write_results,
+};
+sio_context_create(&cfg, &ctx);
+```
+
+This two-phase pattern generalizes to any library built on shift: register components first, let the user compose collections, then create the library context.
+
+## Collections
+
+### User-provided result collections
+
+The user creates these and passes them in `sio_config_t`. Each must contain at least the listed components (extra components are allowed and preserved across moves).
+
+| Collection | Required components | Purpose |
+|---|---|---|
+| `connection_results` | `fd`, `user_data` | New connections appear here after accept |
+| `read_results` | `fd`, `read_buf`, `io_result`, `user_data`, `conn_entity`, `user_conn_entity` | Read completions, EOF, and errors arrive here |
+| `write_results` | `fd`, `write_buf`, `io_result`, `user_data`, `conn_entity`, `user_conn_entity` | Write completions and errors arrive here |
+
+### Library-owned collections
+
+Returned via `sio_get_collection_ids()`.
+
+| Collection | Purpose |
+|---|---|
+| `connections` | Internal connection tracking. User destroys entities here to close a connection. |
+| `read_in` | User moves consumed read entities here to re-arm recv. |
+| `write_in` | User creates write entities here to queue sends. |
+
+### Internal collections (not exposed)
+
+| Collection | Purpose |
+|---|---|
+| `read_pending` | Recv SQE armed, waiting for CQE |
+| `write_pending` | Send SQE submitted, waiting for CQE |
+| `write_retry` | Partial send, retried on next poll tick |
+
+## Components
+
+Registered by `sio_register_components()` and returned as `sio_component_ids_t`.
+
+| Component | Type | Description |
+|---|---|---|
+| `fd` | `sio_fd_t` | Fixed-file slot index (not a real fd) |
+| `read_buf` | `sio_read_buf_t` | Pointer, length, and buffer ID for received data |
+| `write_buf` | `sio_write_buf_t` | Pointer, total length, and bytes-sent offset for outgoing data |
+| `io_result` | `sio_io_result_t` | Error code: 0 = success, negative = errno-style error |
+| `user_data` | `sio_user_data_t` | Application-owned uint64 (initialized to UINT64_MAX) |
+| `conn_entity` | `sio_conn_entity_t` | Handle to the internal `connections` entity for this connection |
+| `user_conn_entity` | `sio_user_conn_entity_t` | Handle to the user's `connection_results` entity |
+
+The last two provide zero-lookup correlation: any read or write result entity carries handles to both the internal connection and the user's connection entity.
+
+## Entity lifetimes
+
+### Connection entity (user's `connection_results`)
 
 ```
-accept → connected → (recv CQE) → reading → sio_write → writing → (send CQE) → connected → …
-                                           → sio_read_consume → connected → …
-                                           → sio_disconnect → destroyed
+accept
+  └─► entity created in connection_results (2-phase: begin → set fd → end)
+      │
+      ├─ lives until disconnect or user-initiated close
+      │
+      └─► destroyed by:
+            • the user (after seeing EOF/error in read_results)
+            • the library (if auto_destroy_user_entity is true)
 ```
 
-**Key design points:**
+Created on accept via two-phase creation. The user can read the `fd` and `user_data` components and attach application state. This entity is long-lived — it persists for the entire connection lifetime. The user is responsible for destroying it after the connection ends (unless `auto_destroy_user_entity` is set).
 
-- Receive buffers are io_uring provided buffers — zero-copy from kernel to application.
-- `sio_write` returns the receive buffer to the ring immediately, so no buffer is held across a send.
-- All entity mutations are deferred through shift — calling `sio_write` or `sio_read_consume` inside an iteration loop is safe; changes take effect on the next `shift_flush`.
+### Internal connection entity (`connections`)
+
+```
+accept
+  └─► entity created in connections (immediate)
+      │
+      ├─ carries: fd, user_conn_entity, read_cycle_entity (internal)
+      │
+      └─► destroyed by:
+            • the user (to initiate close)
+            • on_leave callback fires:
+                • destroys the read-cycle entity
+                • optionally destroys user's connection entity
+            • fd destructor fires: releases fixed-file slot
+```
+
+Created on accept alongside the user connection entity. The user destroys this entity to close a connection. The `on_leave` callback handles cascading cleanup.
+
+### Read-cycle entity
+
+```
+accept
+  └─► entity created in read_pending (immediate)
+      │
+      ├─► recv CQE arrives (data):
+      │     move to read_results ──► user consumes data
+      │                               move to read_in ──► library moves to read_pending
+      │                                                    re-arms recv ──► …
+      │
+      ├─► recv CQE arrives (EOF / error):
+      │     move to read_results ──► user sees error, destroys entity
+      │
+      └─► connection closed (connections entity destroyed):
+            on_leave destroys this entity if still alive
+```
+
+One read-cycle entity exists per connection. It cycles between `read_pending` (internal), the user's `read_results`, and `read_in` (library-owned). It carries `conn_entity` and `user_conn_entity` for correlation.
+
+**Important**: after consuming data from `read_results`, the user must move the entity to `read_in` to re-arm recv. Failing to do so stalls reads on that connection.
+
+### Write entity
+
+```
+user creates entity in write_in
+  │   (set fd, write_buf.data, write_buf.len, conn_entity, user_conn_entity)
+  │
+  ├─► library arms send, moves to write_pending
+  │
+  ├─► send CQE (partial): move to write_retry, retry next tick
+  │
+  ├─► send CQE (complete): move to write_results
+  │     user frees write_buf.data, destroys entity
+  │
+  └─► send CQE (error): move to write_results with io_result.error set
+        user frees write_buf.data, destroys entity
+```
+
+Write entities are created by the user, one per send operation. Multiple writes can be in flight for the same connection. The user must always free `write_buf.data` and destroy the entity after it appears in `write_results`, regardless of success or error. Partial sends are retried automatically.
+
+## Connection close
+
+There are two paths:
+
+**Remote disconnect** (EOF or error on recv):
+1. Read-cycle entity moves to `read_results` with `io_result.error` set (0 for EOF, negative for error) and `read_buf.len == 0`
+2. User sees the error, destroys the read-cycle entity
+3. User destroys the `connections` entity to release the slot
+4. User destroys the `connection_results` entity to clean up application state
+
+**User-initiated close**:
+1. User destroys the `connections` entity
+2. `on_leave` callback destroys the read-cycle entity (returns any held buffer)
+3. `fd` destructor releases the fixed-file slot
+4. Any in-flight recv/send CQEs are filtered by staleness checks
+
+If `auto_destroy_user_entity` is set in the config, the library automatically destroys the user's `connection_results` entity when the `connections` entity is destroyed.
+
+## API reference
+
+### Result codes
+
+| Code | Value | Meaning |
+|---|---|---|
+| `sio_ok` | 0 | Success |
+| `sio_error_null` | -1 | NULL argument |
+| `sio_error_oom` | -2 | Allocation failed |
+| `sio_error_invalid` | -3 | Invalid argument or collection validation failed |
+| `sio_error_io` | -4 | io_uring or socket error |
+| `sio_error_no_sqe` | -5 | io_uring submission queue full |
+
+### `sio_register_components`
+
+```c
+sio_result_t sio_register_components(shift_t *sh, sio_component_ids_t *out);
+```
+
+Registers all sio component types (with constructors and destructors) on the shift context. Must be called before creating user collections. The returned IDs are passed to `sio_context_create` via `sio_config_t::comp_ids`.
+
+### `sio_context_create`
+
+```c
+sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out);
+```
+
+Creates the sio context. Validates that user-provided collections contain the required components (via shift introspection). Registers internal collections, sets up io_uring, allocates the fixed-file pool and provided buffer ring.
+
+`sio_config_t` fields:
+
+| Field | Description |
+|---|---|
+| `shift` | Caller-owned shift context |
+| `comp_ids` | Component IDs from `sio_register_components` |
+| `buf_count` | Number of io_uring provided receive buffers (power of two) |
+| `buf_size` | Size of each receive buffer in bytes |
+| `max_connections` | Maximum concurrent connections (fixed-file pool size) |
+| `ring_entries` | io_uring queue depth |
+| `connection_results` | User collection for new connections |
+| `read_results` | User collection for read completions |
+| `write_results` | User collection for write completions |
+| `auto_destroy_user_entity` | Auto-destroy user connection entity on disconnect |
+
+### `sio_context_destroy`
+
+```c
+void sio_context_destroy(sio_context_t *ctx);
+```
+
+Tears down io_uring, frees buffers, closes the listen socket.
+
+### `sio_listen`
+
+```c
+sio_result_t sio_listen(sio_context_t *ctx, uint16_t port, int backlog);
+```
+
+Opens a non-blocking TCP socket, binds to `INADDR_ANY:port`, and arms a multishot accept. Each accepted connection creates entities in `connection_results`, `connections`, and `read_pending`.
+
+### `sio_poll`
+
+```c
+sio_result_t sio_poll(sio_context_t *ctx, uint32_t min_complete);
+```
+
+Drives the I/O loop for one tick:
+1. Flush batched fixed-file slot releases
+2. Drain `read_in`: return buffers, move to `read_pending`, re-arm recv
+3. Arm sends from `write_retry` (partial) then `write_in` (new)
+4. `shift_flush` (collection membership current before submit)
+5. Submit SQEs, wait for `min_complete` CQEs, dispatch handlers
+6. `shift_flush` (application sees consistent view on return)
+
+### `sio_get_component_ids` / `sio_get_collection_ids`
+
+```c
+const sio_component_ids_t  *sio_get_component_ids(const sio_context_t *ctx);
+const sio_collection_ids_t *sio_get_collection_ids(const sio_context_t *ctx);
+```
+
+Return pointers to the registered IDs. Component IDs are the same as those from `sio_register_components`. Collection IDs give access to `connections`, `read_in`, and `write_in`.
 
 ## Requirements
 
-- Linux kernel ≥ 6.0
-- liburing ≥ 2.4
-- CMake ≥ 3.21
+- Linux kernel >= 6.0
+- liburing >= 2.4
+- CMake >= 3.21
 - C23-capable compiler (GCC 13+ or Clang 16+)
 
 ## Building
@@ -44,124 +279,22 @@ cmake --build build
 
 The `shift` dependency is fetched automatically via CMake FetchContent.
 
-## Example: echo server
+## Example
 
 ```sh
 cmake --build build --target echo_server
-
-./build/examples/echo_server          # terminal 1
-echo "hello" | nc 127.0.0.1 7777      # terminal 2
+./build/examples/echo_server   # terminal 1
+echo "hello" | nc -w 1 localhost 7777   # terminal 2
 ```
 
-The echo server (`examples/echo_server.c`) shows the full application loop:
+See `examples/echo_server.c` for the complete application loop demonstrating setup, read processing, write staging, and cleanup.
 
-```c
-while (running) {
-    sio_poll(ctx, 1);   /* block until at least one event */
-    shift_flush(sh);    /* commit connected→reading moves */
+## Known limitations
 
-    /* get parallel arrays — same index = same entity */
-    shift_collection_get_entities(sh, coll_ids->reading, &entities, &count);
-    shift_collection_get_component_array(sh, coll_ids->reading, comp_ids->fd,       &fds,   NULL);
-    shift_collection_get_component_array(sh, coll_ids->reading, comp_ids->read_buf, &rbufs, NULL);
-
-    for (size_t i = 0; i < count; i++) {
-        /* copy out of the io_uring buffer, then hand it back + queue send */
-        memcpy(reply, rbufs[i].data, rbufs[i].len);
-        sio_write(ctx, entities[i], reply, rbufs[i].len);
-    }
-
-    shift_flush(sh);    /* commit reading→writing moves; next poll submits sends */
-}
-```
-
-## API
-
-### Result codes
-
-| Code | Value | Meaning |
-|------|-------|---------|
-| `sio_ok` | 0 | Success |
-| `sio_error_null` | -1 | NULL argument |
-| `sio_error_oom` | -2 | Allocation failed |
-| `sio_error_invalid` | -3 | Invalid argument |
-| `sio_error_io` | -4 | io_uring or socket error |
-| `sio_error_stale` | -5 | Entity handle is stale |
-| `sio_error_no_sqe` | -6 | io_uring submission queue full |
-
-### Context
-
-```c
-sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out);
-void         sio_context_destroy(sio_context_t *ctx);
-```
-
-`sio_config_t` fields:
-
-| Field | Meaning |
-|-------|---------|
-| `shift` | Caller-owned shift context |
-| `buf_count` | Number of io_uring provided receive buffers (must be a power of two) |
-| `buf_size` | Size of each receive buffer in bytes |
-| `max_fds` | Maximum file descriptor value + 1 |
-| `ring_entries` | io_uring queue depth |
-
-### Listening
-
-```c
-sio_result_t sio_listen(sio_context_t *ctx, uint16_t port, int backlog);
-```
-
-Opens a `SOCK_STREAM` socket, binds to `INADDR_ANY:port`, and arms a multishot accept. Each accepted connection becomes a new entity in the `connected` collection.
-
-### Polling
-
-```c
-sio_result_t sio_poll(sio_context_t *ctx, uint32_t min_complete);
-```
-
-Submits pending sends from the `writing` collection, then waits for at least `min_complete` CQEs and drains the completion queue. Entity moves are queued into shift but not committed — call `shift_flush` afterwards.
-
-### Consuming a read
-
-```c
-sio_result_t sio_read_consume(sio_context_t *ctx, shift_entity_t entity);
-```
-
-Returns the io_uring receive buffer to the ring, moves the entity back to `connected`, and re-arms recv. Use this when the application does not need to send a reply.
-
-### Sending a reply
-
-```c
-sio_result_t sio_write(sio_context_t *ctx, shift_entity_t entity,
-                        const void *data, uint32_t len);
-```
-
-Returns the io_uring receive buffer to the ring, stores `(data, len)` as a pending send, and moves the entity to `writing`. The next `sio_poll` will submit the send SQE. `data` must remain valid until after the send completes (i.e. until the entity returns to `connected`). Recv is not re-armed until the send CQE fires.
-
-### Disconnecting
-
-```c
-sio_result_t sio_disconnect(sio_context_t *ctx, shift_entity_t entity);
-```
-
-Closes the file descriptor and destroys the entity.
-
-### Accessors
-
-```c
-const sio_component_ids_t  *sio_get_component_ids(const sio_context_t *ctx);
-const sio_collection_ids_t *sio_get_collection_ids(const sio_context_t *ctx);
-```
-
-Return the component and collection IDs registered by shift-io, needed to query shift arrays directly.
+- No TLS support.
+- IPv4 only.
+- Single sio context per process (global destructor pointer).
 
 ## License
 
 AGPL-3.0-or-later. See [LICENSE](LICENSE).
-
-## Known limitations
-
-- Partial sends are not retried. The full send is assumed to complete in a single CQE.
-- No TLS support.
-- IPv4 only.
