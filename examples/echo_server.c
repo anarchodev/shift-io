@@ -72,28 +72,26 @@ int main(void) {
   /* Phase 2: create user-owned result collections using sio component IDs */
   shift_collection_id_t connection_results_coll;
   {
-    shift_component_id_t comps[] = {comp_ids.fd, comp_ids.user_data};
-    shift_collection_info_t info = {.comp_ids = comps, .comp_count = 2};
+    shift_component_id_t comps[] = {comp_ids.user_data};
+    shift_collection_info_t info = {.comp_ids = comps, .comp_count = 1};
     shift_collection_register(sh, &info, &connection_results_coll);
   }
 
   shift_collection_id_t read_results_coll;
   {
-    shift_component_id_t comps[] = {comp_ids.fd, comp_ids.read_buf,
-                                    comp_ids.io_result, comp_ids.user_data,
-                                    comp_ids.conn_entity,
+    shift_component_id_t comps[] = {comp_ids.read_buf, comp_ids.io_result,
+                                    comp_ids.user_data, comp_ids.conn_entity,
                                     comp_ids.user_conn_entity};
-    shift_collection_info_t info = {.comp_ids = comps, .comp_count = 6};
+    shift_collection_info_t info = {.comp_ids = comps, .comp_count = 5};
     shift_collection_register(sh, &info, &read_results_coll);
   }
 
   shift_collection_id_t write_results_coll;
   {
-    shift_component_id_t comps[] = {comp_ids.fd, comp_ids.write_buf,
-                                    comp_ids.io_result, comp_ids.user_data,
-                                    comp_ids.conn_entity,
+    shift_component_id_t comps[] = {comp_ids.write_buf, comp_ids.io_result,
+                                    comp_ids.user_data, comp_ids.conn_entity,
                                     comp_ids.user_conn_entity};
-    shift_collection_info_t info = {.comp_ids = comps, .comp_count = 6};
+    shift_collection_info_t info = {.comp_ids = comps, .comp_count = 5};
     shift_collection_register(sh, &info, &write_results_coll);
   }
 
@@ -120,7 +118,7 @@ int main(void) {
   const sio_collection_ids_t *coll_ids = sio_get_collection_ids(ctx);
 
   /* Register echo_pending staging collection with write-side components */
-  SHIFT_COLLECTION(sh, echo_pending_coll, comp_ids.fd, comp_ids.write_buf,
+  SHIFT_COLLECTION(sh, echo_pending_coll, comp_ids.write_buf,
                    comp_ids.io_result, comp_ids.user_data,
                    comp_ids.conn_entity, comp_ids.user_conn_entity);
 
@@ -147,7 +145,6 @@ int main(void) {
     /* ------------------------------------------------------------------ */
     {
       shift_entity_t         *ro_entities = NULL;
-      sio_fd_t               *ro_fds      = NULL;
       sio_read_buf_t         *ro_rbufs    = NULL;
       sio_io_result_t        *ro_results  = NULL;
       sio_conn_entity_t      *ro_conns    = NULL;
@@ -156,9 +153,6 @@ int main(void) {
 
       shift_collection_get_entities(sh, read_results_coll, &ro_entities,
                                     &ro_count);
-      shift_collection_get_component_array(sh, read_results_coll,
-                                           comp_ids.fd,
-                                           (void **)&ro_fds, NULL);
       shift_collection_get_component_array(sh, read_results_coll,
                                            comp_ids.read_buf,
                                            (void **)&ro_rbufs, NULL);
@@ -192,12 +186,6 @@ int main(void) {
           shift_entity_move_one(sh, ro_entities[i], coll_ids->read_in);
           continue;
         }
-
-        /* Copy fd */
-        sio_fd_t *ep_fd = NULL;
-        shift_entity_get_component(sh, ep_entity, comp_ids.fd,
-                                   (void **)&ep_fd);
-        ep_fd->fd = ro_fds[i].fd;
 
         /* Copy connection handles for correlation */
         sio_conn_entity_t *ep_ce = NULL;

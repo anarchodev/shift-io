@@ -19,7 +19,7 @@ sio_register_components(sh, &comp_ids);
 
 /* Phase 2: create user-owned result collections using sio component IDs */
 SHIFT_COLLECTION(sh, my_read_results,
-                 comp_ids.fd, comp_ids.read_buf, comp_ids.io_result,
+                 comp_ids.read_buf, comp_ids.io_result,
                  comp_ids.user_data, comp_ids.conn_entity,
                  comp_ids.user_conn_entity);
 
@@ -48,9 +48,9 @@ The user creates these and passes them in `sio_config_t`. Each must contain at l
 
 | Collection | Required components | Purpose |
 |---|---|---|
-| `connection_results` | `fd`, `user_data` | New connections appear here after accept |
-| `read_results` | `fd`, `read_buf`, `io_result`, `user_data`, `conn_entity`, `user_conn_entity` | Read completions, EOF, and errors arrive here |
-| `write_results` | `fd`, `write_buf`, `io_result`, `user_data`, `conn_entity`, `user_conn_entity` | Write completions and errors arrive here |
+| `connection_results` | `user_data` | New connections appear here after accept |
+| `read_results` | `read_buf`, `io_result`, `user_data`, `conn_entity`, `user_conn_entity` | Read completions, EOF, and errors arrive here |
+| `write_results` | `write_buf`, `io_result`, `user_data`, `conn_entity`, `user_conn_entity` | Write completions and errors arrive here |
 
 ### Library-owned collections
 
@@ -76,7 +76,6 @@ Registered by `sio_register_components()` and returned as `sio_component_ids_t`.
 
 | Component | Type | Description |
 |---|---|---|
-| `fd` | `sio_fd_t` | Fixed-file slot index (not a real fd) |
 | `read_buf` | `sio_read_buf_t` | Pointer, length, and buffer ID for received data |
 | `write_buf` | `sio_write_buf_t` | Pointer, total length, and bytes-sent offset for outgoing data |
 | `io_result` | `sio_io_result_t` | Error code: 0 = success, negative = errno-style error |
@@ -84,7 +83,7 @@ Registered by `sio_register_components()` and returned as `sio_component_ids_t`.
 | `conn_entity` | `sio_conn_entity_t` | Handle to the internal `connections` entity for this connection |
 | `user_conn_entity` | `sio_user_conn_entity_t` | Handle to the user's `connection_results` entity |
 
-The last two provide zero-lookup correlation: any read or write result entity carries handles to both the internal connection and the user's connection entity.
+The `fd` component is internal to the library and not exposed. Users identify connections through entity handles (`conn_entity` and `user_conn_entity`), not file descriptors. The last two components provide zero-lookup correlation: any read or write result entity carries handles to both the internal connection and the user's connection entity.
 
 ## Entity lifetimes
 
@@ -92,7 +91,7 @@ The last two provide zero-lookup correlation: any read or write result entity ca
 
 ```
 accept
-  └─► entity created in connection_results (2-phase: begin → set fd → end)
+  └─► entity created in connection_results (2-phase: begin → end)
       │
       ├─ lives until disconnect or user-initiated close
       │
@@ -101,7 +100,7 @@ accept
             • the library (if auto_destroy_user_entity is true)
 ```
 
-Created on accept via two-phase creation. The user can read the `fd` and `user_data` components and attach application state. This entity is long-lived — it persists for the entire connection lifetime. The user is responsible for destroying it after the connection ends (unless `auto_destroy_user_entity` is set).
+Created on accept via two-phase creation. The user can read the `user_data` component and attach application state. No fd is exposed — connections are identified by entity handle. This entity is long-lived — it persists for the entire connection lifetime. The user is responsible for destroying it after the connection ends (unless `auto_destroy_user_entity` is set).
 
 ### Internal connection entity (`connections`)
 

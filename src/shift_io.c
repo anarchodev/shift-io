@@ -176,14 +176,6 @@ sio_result_t sio_register_components(shift_t *sh, sio_component_ids_t *out) {
   if (!sh || !out)
     return sio_error_null;
 
-  shift_component_info_t fd_info = {
-      .element_size = sizeof(sio_fd_t),
-      .constructor  = NULL,
-      .destructor   = fd_destructor,
-  };
-  if (shift_component_register(sh, &fd_info, &out->fd) != shift_ok)
-    return sio_error_invalid;
-
   shift_component_info_t rb_info = {
       .element_size = sizeof(sio_read_buf_t),
       .constructor  = NULL,
@@ -265,7 +257,16 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
   for (uint32_t i = 0; i < cfg->max_connections; i++)
     ctx->release_minus_one[i] = -1;
 
-  /* Register internal-only component: read_cycle_entity on connections */
+  /* Register internal-only components */
+  {
+    shift_component_info_t fd_info = {
+        .element_size = sizeof(sio_fd_t),
+        .destructor   = fd_destructor,
+    };
+    if (shift_component_register(ctx->shift, &fd_info,
+                                 &ctx->comp_fd) != shift_ok)
+      goto cleanup_pending;
+  }
   {
     shift_component_info_t rce_info = {
         .element_size = sizeof(sio_read_cycle_entity_t),
@@ -276,34 +277,25 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
   }
 
   /* Validate user-provided collections have required components.
-   * Component IDs must be sorted for the two-pointer check. We build
-   * small sorted arrays on the stack for each validation. */
+   * Component IDs must be sorted for the two-pointer check. */
   err = sio_error_invalid;
 
   {
-    /* connection_results must have >= {fd, user_data} */
-    shift_component_id_t conn_req[2] = {ctx->comp_ids.fd,
-                                        ctx->comp_ids.user_data};
-    /* Sort the 2-element array */
-    if (conn_req[0] > conn_req[1]) {
-      shift_component_id_t tmp = conn_req[0];
-      conn_req[0] = conn_req[1];
-      conn_req[1] = tmp;
-    }
+    /* connection_results must have >= {user_data} */
+    shift_component_id_t conn_req[1] = {ctx->comp_ids.user_data};
     if (!sio_collection_has_components(ctx->shift, cfg->connection_results,
-                                      conn_req, 2))
+                                      conn_req, 1))
       goto cleanup_pending;
   }
 
   {
-    /* read_results must have >= {fd, read_buf, io_result, user_data,
+    /* read_results must have >= {read_buf, io_result, user_data,
      *                            conn_entity, user_conn_entity} */
-    shift_component_id_t read_req[6] = {
-        ctx->comp_ids.fd, ctx->comp_ids.read_buf, ctx->comp_ids.io_result,
+    shift_component_id_t read_req[5] = {
+        ctx->comp_ids.read_buf, ctx->comp_ids.io_result,
         ctx->comp_ids.user_data, ctx->comp_ids.conn_entity,
         ctx->comp_ids.user_conn_entity};
-    /* Insertion sort for 6 elements */
-    for (int i = 1; i < 6; i++) {
+    for (int i = 1; i < 5; i++) {
       shift_component_id_t key = read_req[i];
       int j = i - 1;
       while (j >= 0 && read_req[j] > key) {
@@ -313,18 +305,18 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
       read_req[j + 1] = key;
     }
     if (!sio_collection_has_components(ctx->shift, cfg->read_results,
-                                      read_req, 6))
+                                      read_req, 5))
       goto cleanup_pending;
   }
 
   {
-    /* write_results must have >= {fd, write_buf, io_result, user_data,
+    /* write_results must have >= {write_buf, io_result, user_data,
      *                             conn_entity, user_conn_entity} */
-    shift_component_id_t write_req[6] = {
-        ctx->comp_ids.fd, ctx->comp_ids.write_buf, ctx->comp_ids.io_result,
+    shift_component_id_t write_req[5] = {
+        ctx->comp_ids.write_buf, ctx->comp_ids.io_result,
         ctx->comp_ids.user_data, ctx->comp_ids.conn_entity,
         ctx->comp_ids.user_conn_entity};
-    for (int i = 1; i < 6; i++) {
+    for (int i = 1; i < 5; i++) {
       shift_component_id_t key = write_req[i];
       int j = i - 1;
       while (j >= 0 && write_req[j] > key) {
@@ -334,7 +326,7 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
       write_req[j + 1] = key;
     }
     if (!sio_collection_has_components(ctx->shift, cfg->write_results,
-                                      write_req, 6))
+                                      write_req, 5))
       goto cleanup_pending;
   }
 
@@ -347,7 +339,7 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
 
   /* Register connections collection: {fd, user_conn_entity, read_cycle_entity} */
   {
-    shift_component_id_t conn_comps[] = {ctx->comp_ids.fd,
+    shift_component_id_t conn_comps[] = {ctx->comp_fd,
                                          ctx->comp_ids.user_conn_entity,
                                          ctx->comp_read_cycle_entity};
     shift_collection_info_t conn_info = {
@@ -372,7 +364,7 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
   /* Register read collections — all carry
    * {fd, read_buf, io_result, user_data, conn_entity, user_conn_entity} */
   shift_component_id_t read_comps[] = {
-      ctx->comp_ids.fd, ctx->comp_ids.read_buf, ctx->comp_ids.io_result,
+      ctx->comp_fd, ctx->comp_ids.read_buf, ctx->comp_ids.io_result,
       ctx->comp_ids.user_data, ctx->comp_ids.conn_entity,
       ctx->comp_ids.user_conn_entity};
 
@@ -401,7 +393,7 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
   /* Register write collections — all carry
    * {fd, write_buf, io_result, user_data, conn_entity, user_conn_entity} */
   shift_component_id_t write_comps[] = {
-      ctx->comp_ids.fd, ctx->comp_ids.write_buf, ctx->comp_ids.io_result,
+      ctx->comp_fd, ctx->comp_ids.write_buf, ctx->comp_ids.io_result,
       ctx->comp_ids.user_data, ctx->comp_ids.conn_entity,
       ctx->comp_ids.user_conn_entity};
 
@@ -583,20 +575,34 @@ static sio_result_t sio_arm_recv(sio_context_t *ctx, int slot,
  * -------------------------------------------------------------------------- */
 
 static void sio_drain_read_in(sio_context_t *ctx) {
-  shift_entity_t *entities = NULL;
-  sio_fd_t       *fds      = NULL;
-  sio_read_buf_t *rbufs    = NULL;
-  size_t          count    = 0;
+  shift_entity_t    *entities = NULL;
+  sio_read_buf_t    *rbufs    = NULL;
+  sio_conn_entity_t *conns    = NULL;
+  sio_fd_t          *fds      = NULL;
+  size_t             count    = 0;
 
   shift_collection_get_entities(ctx->shift, ctx->coll_ids.read_in, &entities,
                                 &count);
   shift_collection_get_component_array(ctx->shift, ctx->coll_ids.read_in,
-                                       ctx->comp_ids.fd, (void **)&fds, NULL);
-  shift_collection_get_component_array(ctx->shift, ctx->coll_ids.read_in,
                                        ctx->comp_ids.read_buf,
                                        (void **)&rbufs, NULL);
+  shift_collection_get_component_array(ctx->shift, ctx->coll_ids.read_in,
+                                       ctx->comp_ids.conn_entity,
+                                       (void **)&conns, NULL);
+  /* fd is zero-initialized after returning from user's read_results (which
+   * lacks fd).  We also need to write the restored value back so read_pending
+   * has a valid fd for the next CQE cycle. */
+  shift_collection_get_component_array(ctx->shift, ctx->coll_ids.read_in,
+                                       ctx->comp_fd, (void **)&fds, NULL);
 
   for (size_t i = 0; i < count; i++) {
+    /* Restore fd from the connections entity */
+    sio_fd_t *conn_fd = NULL;
+    shift_entity_get_component(ctx->shift, conns[i].entity,
+                               ctx->comp_fd, (void **)&conn_fd);
+    int slot = conn_fd->fd;
+    fds[i].fd = slot;
+
     uint16_t buf_id = rbufs[i].buf_id;
     void    *data   = (char *)ctx->buf_base + (size_t)buf_id * ctx->buf_size;
 
@@ -606,7 +612,7 @@ static void sio_drain_read_in(sio_context_t *ctx) {
 
     io_uring_buf_ring_add(ctx->buf_ring, data, ctx->buf_size, buf_id,
                           io_uring_buf_ring_mask(ctx->buf_count), (int)i);
-    sio_arm_recv(ctx, fds[i].fd, entities[i]);
+    sio_arm_recv(ctx, slot, entities[i]);
   }
   if (count > 0) {
     io_uring_buf_ring_advance(ctx->buf_ring, (int)count);
@@ -621,23 +627,34 @@ static void sio_drain_read_in(sio_context_t *ctx) {
  * -------------------------------------------------------------------------- */
 
 static bool sio_arm_sends(sio_context_t *ctx, shift_collection_id_t coll_id) {
-  shift_entity_t  *ents  = NULL;
-  sio_fd_t        *fds   = NULL;
-  sio_write_buf_t *wbufs = NULL;
-  size_t           count = 0;
+  shift_entity_t    *ents  = NULL;
+  sio_conn_entity_t *conns = NULL;
+  sio_write_buf_t   *wbufs = NULL;
+  sio_fd_t          *fds   = NULL;
+  size_t             count = 0;
 
   shift_collection_get_entities(ctx->shift, coll_id, &ents, &count);
-  shift_collection_get_component_array(ctx->shift, coll_id, ctx->comp_ids.fd,
-                                       (void **)&fds, NULL);
+  shift_collection_get_component_array(ctx->shift, coll_id,
+                                       ctx->comp_ids.conn_entity,
+                                       (void **)&conns, NULL);
   shift_collection_get_component_array(ctx->shift, coll_id,
                                        ctx->comp_ids.write_buf,
                                        (void **)&wbufs, NULL);
+  shift_collection_get_component_array(ctx->shift, coll_id,
+                                       ctx->comp_fd, (void **)&fds, NULL);
 
   for (size_t i = 0; i < count; i++) {
+    /* Look up fd from the connections entity */
+    sio_fd_t *conn_fd = NULL;
+    shift_entity_get_component(ctx->shift, conns[i].entity,
+                               ctx->comp_fd, (void **)&conn_fd);
+    int slot = conn_fd->fd;
+    fds[i].fd = slot; /* restore for write_pending */
+
     struct io_uring_sqe *sqe = io_uring_get_sqe(&ctx->ring);
     if (!sqe)
       return false;
-    io_uring_prep_send(sqe, fds[i].fd,
+    io_uring_prep_send(sqe, slot,
                        (const char *)wbufs[i].data + wbufs[i].offset,
                        wbufs[i].len - wbufs[i].offset, MSG_NOSIGNAL);
     sqe->flags |= IOSQE_FIXED_FILE;
@@ -763,17 +780,8 @@ static sio_result_t sio_handle_accept_cqe(sio_context_t       *ctx,
     return rearm_result;
   }
 
-  /* Set fd on the user connection entity */
-  sio_fd_t *user_fd = NULL;
-  if (shift_entity_get_component(ctx->shift, user_conn, ctx->comp_ids.fd,
-                                 (void **)&user_fd) != shift_ok) {
-    /* collection doesn't have fd — shouldn't happen (validated) */
-    sio_release_slot(ctx, new_slot);
-    return rearm_result;
-  }
-  user_fd->fd = new_slot;
-
-  /* Finish 2-phase create — entity is now visible to user */
+  /* Finish 2-phase create — entity is now visible to user.
+   * No fd is set; users identify connections via entity handles. */
   if (shift_entity_create_one_end(ctx->shift, user_conn) != shift_ok) {
     sio_release_slot(ctx, new_slot);
     return rearm_result;
@@ -790,7 +798,7 @@ static sio_result_t sio_handle_accept_cqe(sio_context_t       *ctx,
 
   /* Set fd on connections entity */
   sio_fd_t *conn_fd = NULL;
-  shift_entity_get_component(ctx->shift, conn_entity, ctx->comp_ids.fd,
+  shift_entity_get_component(ctx->shift, conn_entity, ctx->comp_fd,
                              (void **)&conn_fd);
   conn_fd->fd = new_slot;
 
@@ -812,7 +820,7 @@ static sio_result_t sio_handle_accept_cqe(sio_context_t       *ctx,
 
   /* Set fd on read-cycle entity */
   sio_fd_t *read_fd = NULL;
-  shift_entity_get_component(ctx->shift, read_entity, ctx->comp_ids.fd,
+  shift_entity_get_component(ctx->shift, read_entity, ctx->comp_fd,
                              (void **)&read_fd);
   read_fd->fd = new_slot;
 

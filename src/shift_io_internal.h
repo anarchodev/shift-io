@@ -46,14 +46,22 @@ static inline shift_entity_t sio_ud_entity(uint64_t ud) {
 }
 
 /* --------------------------------------------------------------------------
- * Internal context
+ * Internal component types (not exposed to users)
  * -------------------------------------------------------------------------- */
 
-/* Internal-only component: stored on connections entities to track the
- * associated read-cycle entity for cleanup in the on_leave callback. */
+typedef struct {
+  int fd; /* fixed-file slot index */
+} sio_fd_t;
+
+/* Stored on connections entities to track the associated read-cycle entity
+ * for cleanup in the on_leave callback. */
 typedef struct {
   shift_entity_t entity;
 } sio_read_cycle_entity_t;
+
+/* --------------------------------------------------------------------------
+ * Internal context
+ * -------------------------------------------------------------------------- */
 
 struct sio_context {
   shift_t                  *shift;
@@ -67,7 +75,8 @@ struct sio_context {
   int                       listen_fd; /* -1 if not listening */
   sio_component_ids_t       comp_ids;
   sio_collection_ids_t      coll_ids;  /* connections, read_in, write_in */
-  /* Internal-only component ID for read_cycle_entity on connections */
+  /* Internal-only component IDs (not exposed via sio_component_ids_t) */
+  shift_component_id_t      comp_fd;
   shift_component_id_t      comp_read_cycle_entity;
   /* User-provided result collections */
   shift_collection_id_t     coll_connection_results;

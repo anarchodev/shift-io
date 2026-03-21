@@ -23,10 +23,6 @@ constexpr sio_result_t sio_error_no_sqe  = -5;
  * -------------------------------------------------------------------------- */
 
 typedef struct {
-  int fd;
-} sio_fd_t;
-
-typedef struct {
   void    *data;
   uint32_t len;
   uint16_t buf_id;
@@ -59,7 +55,6 @@ typedef struct {
  * -------------------------------------------------------------------------- */
 
 typedef struct {
-  shift_component_id_t fd;
   shift_component_id_t read_buf;
   shift_component_id_t write_buf;
   shift_component_id_t io_result;
@@ -88,10 +83,10 @@ typedef struct {
   uint32_t ring_entries;    /* io_uring queue depth */
   /* User-provided result collections.  Each must carry at least the required
    * sio components (validated at context creation via introspection).
-   *   connection_results: >= {fd, user_data}
-   *   read_results:       >= {fd, read_buf, io_result, user_data,
+   *   connection_results: >= {user_data}
+   *   read_results:       >= {read_buf, io_result, user_data,
    *                            conn_entity, user_conn_entity}
-   *   write_results:      >= {fd, write_buf, io_result, user_data,
+   *   write_results:      >= {write_buf, io_result, user_data,
    *                            conn_entity, user_conn_entity}           */
   shift_collection_id_t connection_results;
   shift_collection_id_t read_results;
