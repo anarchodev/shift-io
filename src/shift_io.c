@@ -74,15 +74,6 @@ static void read_buf_destructor(shift_t *sh, shift_collection_id_t col_id,
     io_uring_buf_ring_advance(ctx->buf_ring, n);
 }
 
-static void user_data_constructor(shift_t *sh, shift_collection_id_t col_id,
-                                  const shift_entity_t *entities, void *data,
-                                  uint32_t offset, uint32_t count) {
-  (void)sh; (void)col_id; (void)entities;
-  sio_user_data_t *uds = (sio_user_data_t *)data + offset;
-  for (uint32_t i = 0; i < count; i++)
-    uds[i].value = UINT64_MAX;
-}
-
 /* --------------------------------------------------------------------------
  * on_leave callback for the connections collection.
  * When a connections entity is destroyed (user closes the connection),
@@ -196,13 +187,6 @@ sio_result_t sio_register_components(shift_t *sh, sio_component_ids_t *out) {
   if (shift_component_register(sh, &ir_info, &out->io_result) != shift_ok)
     return sio_error_invalid;
 
-  shift_component_info_t ud_info = {
-      .element_size = sizeof(sio_user_data_t),
-      .constructor  = user_data_constructor,
-  };
-  if (shift_component_register(sh, &ud_info, &out->user_data) != shift_ok)
-    return sio_error_invalid;
-
   shift_component_info_t ce_info = {
       .element_size = sizeof(sio_conn_entity_t),
   };
@@ -281,21 +265,12 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
   err = sio_error_invalid;
 
   {
-    /* connection_results must have >= {user_data} */
-    shift_component_id_t conn_req[1] = {ctx->comp_ids.user_data};
-    if (!sio_collection_has_components(ctx->shift, cfg->connection_results,
-                                      conn_req, 1))
-      goto cleanup_pending;
-  }
-
-  {
-    /* read_results must have >= {read_buf, io_result, user_data,
+    /* read_results must have >= {read_buf, io_result,
      *                            conn_entity, user_conn_entity} */
-    shift_component_id_t read_req[5] = {
+    shift_component_id_t read_req[4] = {
         ctx->comp_ids.read_buf, ctx->comp_ids.io_result,
-        ctx->comp_ids.user_data, ctx->comp_ids.conn_entity,
-        ctx->comp_ids.user_conn_entity};
-    for (int i = 1; i < 5; i++) {
+        ctx->comp_ids.conn_entity, ctx->comp_ids.user_conn_entity};
+    for (int i = 1; i < 4; i++) {
       shift_component_id_t key = read_req[i];
       int j = i - 1;
       while (j >= 0 && read_req[j] > key) {
@@ -305,18 +280,17 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
       read_req[j + 1] = key;
     }
     if (!sio_collection_has_components(ctx->shift, cfg->read_results,
-                                      read_req, 5))
+                                      read_req, 4))
       goto cleanup_pending;
   }
 
   {
-    /* write_results must have >= {write_buf, io_result, user_data,
+    /* write_results must have >= {write_buf, io_result,
      *                             conn_entity, user_conn_entity} */
-    shift_component_id_t write_req[5] = {
+    shift_component_id_t write_req[4] = {
         ctx->comp_ids.write_buf, ctx->comp_ids.io_result,
-        ctx->comp_ids.user_data, ctx->comp_ids.conn_entity,
-        ctx->comp_ids.user_conn_entity};
-    for (int i = 1; i < 5; i++) {
+        ctx->comp_ids.conn_entity, ctx->comp_ids.user_conn_entity};
+    for (int i = 1; i < 4; i++) {
       shift_component_id_t key = write_req[i];
       int j = i - 1;
       while (j >= 0 && write_req[j] > key) {
@@ -326,7 +300,7 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
       write_req[j + 1] = key;
     }
     if (!sio_collection_has_components(ctx->shift, cfg->write_results,
-                                      write_req, 5))
+                                      write_req, 4))
       goto cleanup_pending;
   }
 
@@ -362,16 +336,15 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
   }
 
   /* Register read collections — all carry
-   * {fd, read_buf, io_result, user_data, conn_entity, user_conn_entity} */
+   * {fd, read_buf, io_result, conn_entity, user_conn_entity} */
   shift_component_id_t read_comps[] = {
       ctx->comp_fd, ctx->comp_ids.read_buf, ctx->comp_ids.io_result,
-      ctx->comp_ids.user_data, ctx->comp_ids.conn_entity,
-      ctx->comp_ids.user_conn_entity};
+      ctx->comp_ids.conn_entity, ctx->comp_ids.user_conn_entity};
 
   {
     shift_collection_info_t read_pending_info = {
         .comp_ids   = read_comps,
-        .comp_count = 6,
+        .comp_count = 5,
         .max_capacity = 0,
     };
     if (shift_collection_register(ctx->shift, &read_pending_info,
@@ -382,7 +355,7 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
   {
     shift_collection_info_t read_in_info = {
         .comp_ids   = read_comps,
-        .comp_count = 6,
+        .comp_count = 5,
         .max_capacity = 0,
     };
     if (shift_collection_register(ctx->shift, &read_in_info,
@@ -391,16 +364,15 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
   }
 
   /* Register write collections — all carry
-   * {fd, write_buf, io_result, user_data, conn_entity, user_conn_entity} */
+   * {fd, write_buf, io_result, conn_entity, user_conn_entity} */
   shift_component_id_t write_comps[] = {
       ctx->comp_fd, ctx->comp_ids.write_buf, ctx->comp_ids.io_result,
-      ctx->comp_ids.user_data, ctx->comp_ids.conn_entity,
-      ctx->comp_ids.user_conn_entity};
+      ctx->comp_ids.conn_entity, ctx->comp_ids.user_conn_entity};
 
   {
     shift_collection_info_t write_in_info = {
         .comp_ids   = write_comps,
-        .comp_count = 6,
+        .comp_count = 5,
         .max_capacity = 0,
     };
     if (shift_collection_register(ctx->shift, &write_in_info,
@@ -411,7 +383,7 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
   {
     shift_collection_info_t write_pending_info = {
         .comp_ids   = write_comps,
-        .comp_count = 6,
+        .comp_count = 5,
         .max_capacity = 0,
     };
     if (shift_collection_register(ctx->shift, &write_pending_info,
@@ -422,7 +394,7 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
   {
     shift_collection_info_t write_retry_info = {
         .comp_ids   = write_comps,
-        .comp_count = 6,
+        .comp_count = 5,
         .max_capacity = 0,
     };
     if (shift_collection_register(ctx->shift, &write_retry_info,

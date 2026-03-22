@@ -72,26 +72,25 @@ int main(void) {
   /* Phase 2: create user-owned result collections using sio component IDs */
   shift_collection_id_t connection_results_coll;
   {
-    shift_component_id_t comps[] = {comp_ids.user_data};
-    shift_collection_info_t info = {.comp_ids = comps, .comp_count = 1};
+    shift_collection_info_t info = {.comp_ids = NULL, .comp_count = 0};
     shift_collection_register(sh, &info, &connection_results_coll);
   }
 
   shift_collection_id_t read_results_coll;
   {
     shift_component_id_t comps[] = {comp_ids.read_buf, comp_ids.io_result,
-                                    comp_ids.user_data, comp_ids.conn_entity,
+                                    comp_ids.conn_entity,
                                     comp_ids.user_conn_entity};
-    shift_collection_info_t info = {.comp_ids = comps, .comp_count = 5};
+    shift_collection_info_t info = {.comp_ids = comps, .comp_count = 4};
     shift_collection_register(sh, &info, &read_results_coll);
   }
 
   shift_collection_id_t write_results_coll;
   {
     shift_component_id_t comps[] = {comp_ids.write_buf, comp_ids.io_result,
-                                    comp_ids.user_data, comp_ids.conn_entity,
+                                    comp_ids.conn_entity,
                                     comp_ids.user_conn_entity};
-    shift_collection_info_t info = {.comp_ids = comps, .comp_count = 5};
+    shift_collection_info_t info = {.comp_ids = comps, .comp_count = 4};
     shift_collection_register(sh, &info, &write_results_coll);
   }
 
@@ -119,8 +118,8 @@ int main(void) {
 
   /* Register echo_pending staging collection with write-side components */
   SHIFT_COLLECTION(sh, echo_pending_coll, comp_ids.write_buf,
-                   comp_ids.io_result, comp_ids.user_data,
-                   comp_ids.conn_entity, comp_ids.user_conn_entity);
+                   comp_ids.io_result, comp_ids.conn_entity,
+                   comp_ids.user_conn_entity);
 
   if (sio_listen(ctx, PORT, BACKLOG) != sio_ok) {
     fprintf(stderr, "sio_listen failed on port %d\n", PORT);

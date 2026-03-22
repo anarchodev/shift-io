@@ -33,10 +33,6 @@ typedef struct {
 } sio_io_result_t;
 
 typedef struct {
-  uint64_t value;
-} sio_user_data_t;
-
-typedef struct {
   const void *data;    /* original malloc'd pointer; app always frees this */
   uint32_t    len;     /* total bytes to send */
   uint32_t    offset;  /* bytes already sent; initialise to 0 */
@@ -58,7 +54,6 @@ typedef struct {
   shift_component_id_t read_buf;
   shift_component_id_t write_buf;
   shift_component_id_t io_result;
-  shift_component_id_t user_data;
   shift_component_id_t conn_entity;      /* sio_conn_entity_t */
   shift_component_id_t user_conn_entity; /* sio_user_conn_entity_t */
 } sio_component_ids_t;
@@ -83,10 +78,10 @@ typedef struct {
   uint32_t ring_entries;    /* io_uring queue depth */
   /* User-provided result collections.  Each must carry at least the required
    * sio components (validated at context creation via introspection).
-   *   connection_results: >= {user_data}
-   *   read_results:       >= {read_buf, io_result, user_data,
+   *   connection_results: (no required components)
+   *   read_results:       >= {read_buf, io_result,
    *                            conn_entity, user_conn_entity}
-   *   write_results:      >= {write_buf, io_result, user_data,
+   *   write_results:      >= {write_buf, io_result,
    *                            conn_entity, user_conn_entity}           */
   shift_collection_id_t connection_results;
   shift_collection_id_t read_results;
