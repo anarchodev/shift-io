@@ -78,7 +78,7 @@ typedef struct {
   uint32_t ring_entries;    /* io_uring queue depth */
   /* User-provided result collections.  Each must carry at least the required
    * sio components (validated at context creation via introspection).
-   *   connection_results: (no required components)
+   *   connection_results: >= {conn_entity}
    *   read_results:       >= {read_buf, io_result,
    *                            conn_entity, user_conn_entity}
    *   write_results:      >= {write_buf, io_result,

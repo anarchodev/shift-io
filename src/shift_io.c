@@ -265,6 +265,14 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
   err = sio_error_invalid;
 
   {
+    /* connection_results must have >= {conn_entity} */
+    shift_component_id_t conn_req[1] = {ctx->comp_ids.conn_entity};
+    if (!sio_collection_has_components(ctx->shift, cfg->connection_results,
+                                      conn_req, 1))
+      goto cleanup_pending;
+  }
+
+  {
     /* read_results must have >= {read_buf, io_result,
      *                            conn_entity, user_conn_entity} */
     shift_component_id_t read_req[4] = {
@@ -716,10 +724,10 @@ sio_result_t sio_listen(sio_context_t *ctx, uint16_t port, int backlog) {
  * sio_handle_accept_cqe (static)
  *
  * New connection flow:
- * 1. 2-phase create entity in user's connection_results
- * 2. Create entity in internal connections collection
+ * 1. Create entity in internal connections collection
+ * 2. 2-phase create entity in user's connection_results (with conn_entity set)
  * 3. Create read-cycle entity in read_pending
- * 4. Link them all together and arm recv
+ * 4. Link them together and arm recv
  * -------------------------------------------------------------------------- */
 
 static sio_result_t sio_handle_accept_cqe(sio_context_t       *ctx,
@@ -744,27 +752,11 @@ static sio_result_t sio_handle_accept_cqe(sio_context_t       *ctx,
   if (!(flags & IORING_CQE_F_MORE))
     rearm_result = sio_arm_accept(ctx);
 
-  /* Step 1: 2-phase create entity in user's connection_results */
-  shift_entity_t user_conn;
-  if (shift_entity_create_one_begin(ctx->shift, ctx->coll_connection_results,
-                                    &user_conn) != shift_ok) {
-    sio_release_slot(ctx, new_slot);
-    return rearm_result;
-  }
-
-  /* Finish 2-phase create — entity is now visible to user.
-   * No fd is set; users identify connections via entity handles. */
-  if (shift_entity_create_one_end(ctx->shift, user_conn) != shift_ok) {
-    sio_release_slot(ctx, new_slot);
-    return rearm_result;
-  }
-
-  /* Step 2: Create entity in internal connections collection */
+  /* Step 1: Create entity in internal connections collection */
   shift_entity_t conn_entity;
   if (shift_entity_create_one_immediate(ctx->shift, ctx->coll_ids.connections,
                                         &conn_entity) != shift_ok) {
     sio_release_slot(ctx, new_slot);
-    shift_entity_destroy_one(ctx->shift, user_conn);
     return rearm_result;
   }
 
@@ -774,7 +766,31 @@ static sio_result_t sio_handle_accept_cqe(sio_context_t       *ctx,
                              (void **)&conn_fd);
   conn_fd->fd = new_slot;
 
-  /* Store user connection entity handle */
+  /* Step 2: 2-phase create entity in user's connection_results.
+   * Created after the connections entity so we can set conn_entity
+   * between begin and end. */
+  shift_entity_t user_conn;
+  if (shift_entity_create_one_begin(ctx->shift, ctx->coll_connection_results,
+                                    &user_conn) != shift_ok) {
+    sio_release_slot(ctx, new_slot);
+    shift_entity_destroy_one(ctx->shift, conn_entity);
+    return rearm_result;
+  }
+
+  /* Set conn_entity on user connection entity — link to internal connection */
+  sio_conn_entity_t *user_ce = NULL;
+  shift_entity_get_component(ctx->shift, user_conn, ctx->comp_ids.conn_entity,
+                             (void **)&user_ce);
+  user_ce->entity = conn_entity;
+
+  /* Finish 2-phase create — entity is now visible to user */
+  if (shift_entity_create_one_end(ctx->shift, user_conn) != shift_ok) {
+    sio_release_slot(ctx, new_slot);
+    shift_entity_destroy_one(ctx->shift, conn_entity);
+    return rearm_result;
+  }
+
+  /* Store user connection entity handle on connections entity */
   sio_user_conn_entity_t *uce = NULL;
   shift_entity_get_component(ctx->shift, conn_entity,
                              ctx->comp_ids.user_conn_entity, (void **)&uce);

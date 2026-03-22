@@ -17,17 +17,24 @@ Construction is two-phase so that component IDs are available before collections
 sio_component_ids_t comp_ids;
 sio_register_components(sh, &comp_ids);
 
-/* Phase 2: create user-owned result collections using sio component IDs */
+/* Phase 2: create user-owned result collections using sio component IDs.
+ * Extra components can be added for application state. */
+SHIFT_COLLECTION(sh, my_connection_results,
+                 comp_ids.conn_entity);
+
 SHIFT_COLLECTION(sh, my_read_results,
                  comp_ids.read_buf, comp_ids.io_result,
-                 comp_ids.user_data, comp_ids.conn_entity,
-                 comp_ids.user_conn_entity);
+                 comp_ids.conn_entity, comp_ids.user_conn_entity);
+
+SHIFT_COLLECTION(sh, my_write_results,
+                 comp_ids.write_buf, comp_ids.io_result,
+                 comp_ids.conn_entity, comp_ids.user_conn_entity);
 
 /* Phase 3: create sio context */
 sio_config_t cfg = {
     .shift              = sh,
     .comp_ids           = comp_ids,
-    .buf_count          = 64,
+    .buf_count          = 64,       /* must be power of two */
     .buf_size           = 4096,
     .max_connections    = 4096,
     .ring_entries       = 256,
@@ -44,13 +51,13 @@ This two-phase pattern generalizes to any library built on shift: register compo
 
 ### User-provided result collections
 
-The user creates these and passes them in `sio_config_t`. Each must contain at least the listed components (extra components are allowed and preserved across moves).
+The user creates these and passes them in `sio_config_t`. Each must contain at least the listed components (extra components are allowed and preserved across entity moves).
 
 | Collection | Required components | Purpose |
 |---|---|---|
-| `connection_results` | `user_data` | New connections appear here after accept |
-| `read_results` | `read_buf`, `io_result`, `user_data`, `conn_entity`, `user_conn_entity` | Read completions, EOF, and errors arrive here |
-| `write_results` | `write_buf`, `io_result`, `user_data`, `conn_entity`, `user_conn_entity` | Write completions and errors arrive here |
+| `connection_results` | `conn_entity` | New connections appear here after accept. `conn_entity` links to the internal `connections` entity. Add custom components to track per-connection application state — component constructors fire on entity creation. |
+| `read_results` | `read_buf`, `io_result`, `conn_entity`, `user_conn_entity` | Read completions, EOF, and errors arrive here |
+| `write_results` | `write_buf`, `io_result`, `conn_entity`, `user_conn_entity` | Write completions and errors arrive here |
 
 ### Library-owned collections
 
@@ -58,7 +65,7 @@ Returned via `sio_get_collection_ids()`.
 
 | Collection | Purpose |
 |---|---|
-| `connections` | Internal connection tracking. User destroys entities here to close a connection. |
+| `connections` | Internal connection tracking. **Only destroy entities here** — do not move entities out or modify components. Destroying an entity closes the connection. |
 | `read_in` | User moves consumed read entities here to re-arm recv. |
 | `write_in` | User creates write entities here to queue sends. |
 
@@ -79,11 +86,10 @@ Registered by `sio_register_components()` and returned as `sio_component_ids_t`.
 | `read_buf` | `sio_read_buf_t` | Pointer, length, and buffer ID for received data |
 | `write_buf` | `sio_write_buf_t` | Pointer, total length, and bytes-sent offset for outgoing data |
 | `io_result` | `sio_io_result_t` | Error code: 0 = success, negative = errno-style error |
-| `user_data` | `sio_user_data_t` | Application-owned uint64 (initialized to UINT64_MAX) |
 | `conn_entity` | `sio_conn_entity_t` | Handle to the internal `connections` entity for this connection |
 | `user_conn_entity` | `sio_user_conn_entity_t` | Handle to the user's `connection_results` entity |
 
-The `fd` component is internal to the library and not exposed. Users identify connections through entity handles (`conn_entity` and `user_conn_entity`), not file descriptors. The last two components provide zero-lookup correlation: any read or write result entity carries handles to both the internal connection and the user's connection entity.
+The `fd` component is internal to the library and not exposed. Users identify connections through entity handles (`conn_entity` and `user_conn_entity`), not file descriptors. These two components provide zero-lookup correlation: any read or write result entity carries handles to both the internal connection and the user's connection entity.
 
 ## Entity lifetimes
 
@@ -100,7 +106,7 @@ accept
             • the library (if auto_destroy_user_entity is true)
 ```
 
-Created on accept via two-phase creation. The user can read the `user_data` component and attach application state. No fd is exposed — connections are identified by entity handle. This entity is long-lived — it persists for the entire connection lifetime. The user is responsible for destroying it after the connection ends (unless `auto_destroy_user_entity` is set).
+Created on accept via two-phase creation. The `conn_entity` component is set by the library, linking this entity to the internal `connections` entity. The user can attach application state via custom components on the collection — component constructors fire during creation, making this the natural place for per-connection initialization. No fd is exposed; connections are identified by entity handle. This entity is long-lived and persists for the entire connection lifetime. The user is responsible for destroying it after the connection ends (unless `auto_destroy_user_entity` is set).
 
 ### Internal connection entity (`connections`)
 
@@ -140,13 +146,28 @@ accept
 
 One read-cycle entity exists per connection. It cycles between `read_pending` (internal), the user's `read_results`, and `read_in` (library-owned). It carries `conn_entity` and `user_conn_entity` for correlation.
 
-**Important**: after consuming data from `read_results`, the user must move the entity to `read_in` to re-arm recv. Failing to do so stalls reads on that connection.
+**Consuming a read result:**
+
+1. Read `read_buf.data` and `read_buf.len` to access the received data
+2. Copy out any data you need — `read_buf.data` points into a kernel provided buffer that is returned when the entity moves
+3. Move the entity to `read_in`
+4. **Do not** hold a pointer to `read_buf.data` after the move — the buffer is immediately returned to the kernel and may be reused
+
+Failing to move the entity to `read_in` stalls reads on that connection.
+
+**Detecting EOF vs error:**
+
+- `io_result.error == 0` and `read_buf.len > 0`: data received
+- `io_result.error == 0` and `read_buf.len == 0`: EOF (remote closed gracefully)
+- `io_result.error < 0`: error (negative errno, e.g. `-ECONNRESET`)
+
+On EOF or error, destroy the read-cycle entity and the `connections` entity (via `conn_entity`).
 
 ### Write entity
 
 ```
 user creates entity in write_in
-  │   (set fd, write_buf.data, write_buf.len, conn_entity, user_conn_entity)
+  │   (set write_buf.data, write_buf.len, conn_entity, user_conn_entity)
   │
   ├─► library arms send, moves to write_pending
   │
@@ -159,17 +180,40 @@ user creates entity in write_in
         user frees write_buf.data, destroys entity
 ```
 
-Write entities are created by the user, one per send operation. Multiple writes can be in flight for the same connection. The user must always free `write_buf.data` and destroy the entity after it appears in `write_results`, regardless of success or error. Partial sends are retried automatically.
+Write entities are created by the user, one per send operation. Multiple writes can be in flight for the same connection. Partial sends are retried automatically.
+
+**Creating a write entity:**
+
+```c
+shift_entity_t wr;
+shift_entity_create_one_immediate(sh, coll_ids->write_in, &wr);
+
+sio_write_buf_t *wb = NULL;
+shift_entity_get_component(sh, wr, comp_ids.write_buf, (void **)&wb);
+wb->data   = my_data;   /* must remain valid until write_results */
+wb->len    = my_len;
+wb->offset = 0;         /* must be initialized to 0 */
+
+sio_conn_entity_t *ce = NULL;
+shift_entity_get_component(sh, wr, comp_ids.conn_entity, (void **)&ce);
+ce->entity = conn;      /* from a read result's conn_entity */
+
+sio_user_conn_entity_t *uce = NULL;
+shift_entity_get_component(sh, wr, comp_ids.user_conn_entity, (void **)&uce);
+uce->entity = user_conn; /* from a read result's user_conn_entity */
+```
+
+**Important**: `write_buf.data` must point to memory that remains valid until the entity appears in `write_results`. The user must always free `write_buf.data` and destroy the entity after it arrives in `write_results`, regardless of success or error.
 
 ## Connection close
 
 There are two paths:
 
 **Remote disconnect** (EOF or error on recv):
-1. Read-cycle entity moves to `read_results` with `io_result.error` set (0 for EOF, negative for error) and `read_buf.len == 0`
-2. User sees the error, destroys the read-cycle entity
-3. User destroys the `connections` entity to release the slot
-4. User destroys the `connection_results` entity to clean up application state
+1. Read-cycle entity moves to `read_results` with EOF (`io_result.error == 0`, `read_buf.len == 0`) or error (`io_result.error < 0`)
+2. User destroys the read-cycle entity
+3. User destroys the `connections` entity (via `conn_entity`) to release the fixed-file slot
+4. User destroys the `connection_results` entity (via `user_conn_entity`) to clean up application state — or omit this step if `auto_destroy_user_entity` is set
 
 **User-initiated close**:
 1. User destroys the `connections` entity
@@ -178,6 +222,18 @@ There are two paths:
 4. Any in-flight recv/send CQEs are filtered by staleness checks
 
 If `auto_destroy_user_entity` is set in the config, the library automatically destroys the user's `connection_results` entity when the `connections` entity is destroyed.
+
+## Flush timing
+
+`sio_poll` calls `shift_flush` internally (twice: before submit and after CQE dispatch). However, if the user creates, moves, or destroys entities between `sio_poll` calls (e.g. creating write entities, moving reads to `read_in`, destroying on close), those operations are deferred. The user should call `shift_flush` after their processing loop so that the next `sio_poll` sees a consistent state.
+
+```c
+while (running) {
+    sio_poll(ctx, 1);
+    /* ... process read_results, create writes, handle close ... */
+    shift_flush(sh);  /* commit user-side entity operations */
+}
+```
 
 ## API reference
 
@@ -214,7 +270,7 @@ Creates the sio context. Validates that user-provided collections contain the re
 |---|---|
 | `shift` | Caller-owned shift context |
 | `comp_ids` | Component IDs from `sio_register_components` |
-| `buf_count` | Number of io_uring provided receive buffers (power of two) |
+| `buf_count` | Number of io_uring provided receive buffers (must be power of two) |
 | `buf_size` | Size of each receive buffer in bytes |
 | `max_connections` | Maximum concurrent connections (fixed-file pool size) |
 | `ring_entries` | io_uring queue depth |
