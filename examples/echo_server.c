@@ -27,11 +27,6 @@ static void handle_signal(int sig) {
  *   2. Create user-owned result collections with those IDs
  *   3. sio_context_create() — pass component IDs + collection IDs
  *
- * Connection lifecycle:
- *   accept → connection_results (user sees new connection)
- *          → connections (user destroys to close)
- *          → read_pending (internal, recv armed)
- *
  * Read cycle:
  *   read_pending → read_results (user sees data/EOF/error)
  *               → read_in (user done) → read_pending → …
@@ -69,45 +64,34 @@ int main(void) {
     return 1;
   }
 
-  /* Phase 2: create user-owned result collections using sio component IDs */
-  shift_collection_id_t connection_results_coll;
-  {
-    shift_component_id_t comps[] = {comp_ids.user_data};
-    shift_collection_info_t info = {.comp_ids = comps, .comp_count = 1};
-    shift_collection_register(sh, &info, &connection_results_coll);
-  }
-
+  /* Phase 2: create user-owned result collections */
   shift_collection_id_t read_results_coll;
   {
     shift_component_id_t comps[] = {comp_ids.read_buf, comp_ids.io_result,
-                                    comp_ids.user_data, comp_ids.conn_entity,
-                                    comp_ids.user_conn_entity};
-    shift_collection_info_t info = {.comp_ids = comps, .comp_count = 5};
+                                    comp_ids.conn_entity};
+    shift_collection_info_t info = {.comp_ids = comps, .comp_count = 3};
     shift_collection_register(sh, &info, &read_results_coll);
   }
 
   shift_collection_id_t write_results_coll;
   {
     shift_component_id_t comps[] = {comp_ids.write_buf, comp_ids.io_result,
-                                    comp_ids.user_data, comp_ids.conn_entity,
-                                    comp_ids.user_conn_entity};
-    shift_collection_info_t info = {.comp_ids = comps, .comp_count = 5};
+                                    comp_ids.conn_entity};
+    shift_collection_info_t info = {.comp_ids = comps, .comp_count = 3};
     shift_collection_register(sh, &info, &write_results_coll);
   }
 
-  /* Phase 3: create sio context with pre-registered components + user collections */
+  /* Phase 3: create sio context */
   sio_context_t *ctx     = NULL;
   sio_config_t   sio_cfg = {
-      .shift              = sh,
-      .comp_ids           = comp_ids,
-      .buf_count          = BUF_COUNT,
-      .buf_size           = BUF_SIZE,
-      .max_connections    = MAX_CONNECTIONS,
-      .ring_entries       = 256,
-      .connection_results = connection_results_coll,
-      .read_results       = read_results_coll,
-      .write_results      = write_results_coll,
-      .auto_destroy_user_entity = false,
+      .shift           = sh,
+      .comp_ids        = comp_ids,
+      .buf_count       = BUF_COUNT,
+      .buf_size        = BUF_SIZE,
+      .max_connections = MAX_CONNECTIONS,
+      .ring_entries    = 256,
+      .read_results    = read_results_coll,
+      .write_results   = write_results_coll,
   };
   if (sio_context_create(&sio_cfg, &ctx) != sio_ok) {
     fprintf(stderr, "sio_context_create failed\n");
@@ -119,8 +103,7 @@ int main(void) {
 
   /* Register echo_pending staging collection with write-side components */
   SHIFT_COLLECTION(sh, echo_pending_coll, comp_ids.write_buf,
-                   comp_ids.io_result, comp_ids.user_data,
-                   comp_ids.conn_entity, comp_ids.user_conn_entity);
+                   comp_ids.io_result, comp_ids.conn_entity);
 
   if (sio_listen(ctx, PORT, BACKLOG) != sio_ok) {
     fprintf(stderr, "sio_listen failed on port %d\n", PORT);
@@ -144,12 +127,11 @@ int main(void) {
     /* Process read_results: create echo write jobs or handle close.       */
     /* ------------------------------------------------------------------ */
     {
-      shift_entity_t         *ro_entities = NULL;
-      sio_read_buf_t         *ro_rbufs    = NULL;
-      sio_io_result_t        *ro_results  = NULL;
-      sio_conn_entity_t      *ro_conns    = NULL;
-      sio_user_conn_entity_t *ro_uconns   = NULL;
-      size_t                  ro_count    = 0;
+      shift_entity_t    *ro_entities = NULL;
+      sio_read_buf_t    *ro_rbufs    = NULL;
+      sio_io_result_t   *ro_results  = NULL;
+      sio_conn_entity_t *ro_conns    = NULL;
+      size_t             ro_count    = 0;
 
       shift_collection_get_entities(sh, read_results_coll, &ro_entities,
                                     &ro_count);
@@ -162,9 +144,6 @@ int main(void) {
       shift_collection_get_component_array(sh, read_results_coll,
                                            comp_ids.conn_entity,
                                            (void **)&ro_conns, NULL);
-      shift_collection_get_component_array(sh, read_results_coll,
-                                           comp_ids.user_conn_entity,
-                                           (void **)&ro_uconns, NULL);
 
       for (size_t i = 0; i < ro_count; i++) {
         /* Connection closed or error */
@@ -173,9 +152,6 @@ int main(void) {
           /* Destroy connections entity → on_leave releases slot */
           if (!shift_entity_is_stale(sh, ro_conns[i].entity))
             shift_entity_destroy_one(sh, ro_conns[i].entity);
-          /* Destroy user connection entity */
-          if (!shift_entity_is_stale(sh, ro_uconns[i].entity))
-            shift_entity_destroy_one(sh, ro_uconns[i].entity);
           continue;
         }
 
@@ -187,16 +163,11 @@ int main(void) {
           continue;
         }
 
-        /* Copy connection handles for correlation */
+        /* Copy connection handle for correlation */
         sio_conn_entity_t *ep_ce = NULL;
         shift_entity_get_component(sh, ep_entity, comp_ids.conn_entity,
                                    (void **)&ep_ce);
         ep_ce->entity = ro_conns[i].entity;
-
-        sio_user_conn_entity_t *ep_uce = NULL;
-        shift_entity_get_component(sh, ep_entity, comp_ids.user_conn_entity,
-                                   (void **)&ep_uce);
-        ep_uce->entity = ro_uconns[i].entity;
 
         /* Malloc and copy received data */
         sio_write_buf_t *ep_wb = NULL;
