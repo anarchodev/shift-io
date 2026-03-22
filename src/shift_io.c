@@ -575,7 +575,15 @@ static void sio_drain_read_in(sio_context_t *ctx) {
   shift_collection_get_component_array(ctx->shift, ctx->coll_ids.read_in,
                                        ctx->comp_fd, (void **)&fds, NULL);
 
+  int armed = 0;
   for (size_t i = 0; i < count; i++) {
+    /* Connection destroyed while this read was in the user's hands —
+     * destroy the read entity (read_buf_destructor returns the buffer). */
+    if (shift_entity_is_stale(ctx->shift, conns[i].entity)) {
+      shift_entity_destroy_one(ctx->shift, entities[i]);
+      continue;
+    }
+
     /* Restore fd from the connections entity */
     sio_fd_t *conn_fd = NULL;
     shift_entity_get_component(ctx->shift, conns[i].entity,
@@ -591,13 +599,13 @@ static void sio_drain_read_in(sio_context_t *ctx) {
     rbufs[i].buf_id = 0;
 
     io_uring_buf_ring_add(ctx->buf_ring, data, ctx->buf_size, buf_id,
-                          io_uring_buf_ring_mask(ctx->buf_count), (int)i);
+                          io_uring_buf_ring_mask(ctx->buf_count), armed);
     sio_arm_recv(ctx, slot, entities[i]);
+    shift_entity_move_one(ctx->shift, entities[i], ctx->coll_read_pending);
+    armed++;
   }
-  if (count > 0) {
-    io_uring_buf_ring_advance(ctx->buf_ring, (int)count);
-    shift_entity_move(ctx->shift, entities, (uint32_t)count, ctx->coll_read_pending);
-  }
+  if (armed > 0)
+    io_uring_buf_ring_advance(ctx->buf_ring, armed);
 }
 
 /* --------------------------------------------------------------------------
@@ -624,6 +632,13 @@ static bool sio_arm_sends(sio_context_t *ctx, shift_collection_id_t coll_id) {
                                        ctx->comp_fd, (void **)&fds, NULL);
 
   for (size_t i = 0; i < count; i++) {
+    /* Connection destroyed while this write was queued —
+     * discard the write entity. */
+    if (shift_entity_is_stale(ctx->shift, conns[i].entity)) {
+      shift_entity_destroy_one(ctx->shift, ents[i]);
+      continue;
+    }
+
     /* Look up fd from the connections entity */
     sio_fd_t *conn_fd = NULL;
     shift_entity_get_component(ctx->shift, conns[i].entity,
