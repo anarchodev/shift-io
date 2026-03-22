@@ -6,9 +6,7 @@ A C23 TCP networking library built on [shift](https://github.com/anarchodev/shif
 
 `shift-io` maps TCP connections to shift entities and drives them through collections as I/O events arrive. Application code never touches sockets or io_uring directly — it iterates SoA arrays from shift collections and moves entities between collections to drive the I/O lifecycle.
 
-The user provides their own result collections for reads and writes. These collections must carry at least the required sio components but may include additional application-specific components. This lets the application attach custom state directly to I/O entities without external lookup tables.
-
-Users react to new connections via `on_enter` callbacks on the `connections` collection or constructors on custom components. Connections are identified by `conn_entity` handles — no file descriptors are exposed.
+The user provides their own result collections for connections, reads, and writes. These collections must carry at least the required sio components but may include additional application-specific components. This lets the application attach custom state directly to I/O entities without external lookup tables.
 
 ## Setup
 
@@ -22,22 +20,20 @@ sio_register_components(sh, &comp_ids);
 /* Phase 2: create user-owned result collections using sio component IDs */
 SHIFT_COLLECTION(sh, my_read_results,
                  comp_ids.read_buf, comp_ids.io_result,
-                 comp_ids.conn_entity);
-
-SHIFT_COLLECTION(sh, my_write_results,
-                 comp_ids.write_buf, comp_ids.io_result,
-                 comp_ids.conn_entity);
+                 comp_ids.user_data, comp_ids.conn_entity,
+                 comp_ids.user_conn_entity);
 
 /* Phase 3: create sio context */
 sio_config_t cfg = {
-    .shift         = sh,
-    .comp_ids      = comp_ids,
-    .buf_count     = 64,
-    .buf_size      = 4096,
-    .max_connections = 4096,
-    .ring_entries  = 256,
-    .read_results  = my_read_results,
-    .write_results = my_write_results,
+    .shift              = sh,
+    .comp_ids           = comp_ids,
+    .buf_count          = 64,
+    .buf_size           = 4096,
+    .max_connections    = 4096,
+    .ring_entries       = 256,
+    .connection_results = my_connection_results,
+    .read_results       = my_read_results,
+    .write_results      = my_write_results,
 };
 sio_context_create(&cfg, &ctx);
 ```
@@ -52,8 +48,9 @@ The user creates these and passes them in `sio_config_t`. Each must contain at l
 
 | Collection | Required components | Purpose |
 |---|---|---|
-| `read_results` | `read_buf`, `io_result`, `conn_entity` | Read completions, EOF, and errors arrive here |
-| `write_results` | `write_buf`, `io_result`, `conn_entity` | Write completions and errors arrive here |
+| `connection_results` | `user_data` | New connections appear here after accept |
+| `read_results` | `read_buf`, `io_result`, `user_data`, `conn_entity`, `user_conn_entity` | Read completions, EOF, and errors arrive here |
+| `write_results` | `write_buf`, `io_result`, `user_data`, `conn_entity`, `user_conn_entity` | Write completions and errors arrive here |
 
 ### Library-owned collections
 
@@ -61,7 +58,7 @@ Returned via `sio_get_collection_ids()`.
 
 | Collection | Purpose |
 |---|---|
-| `connections` | Internal connection tracking. User destroys entities here to close a connection. Register `on_enter` to react to new connections. |
+| `connections` | Internal connection tracking. User destroys entities here to close a connection. |
 | `read_in` | User moves consumed read entities here to re-arm recv. |
 | `write_in` | User creates write entities here to queue sends. |
 
@@ -82,11 +79,28 @@ Registered by `sio_register_components()` and returned as `sio_component_ids_t`.
 | `read_buf` | `sio_read_buf_t` | Pointer, length, and buffer ID for received data |
 | `write_buf` | `sio_write_buf_t` | Pointer, total length, and bytes-sent offset for outgoing data |
 | `io_result` | `sio_io_result_t` | Error code: 0 = success, negative = errno-style error |
+| `user_data` | `sio_user_data_t` | Application-owned uint64 (initialized to UINT64_MAX) |
 | `conn_entity` | `sio_conn_entity_t` | Handle to the internal `connections` entity for this connection |
+| `user_conn_entity` | `sio_user_conn_entity_t` | Handle to the user's `connection_results` entity |
 
-The `fd` component is internal to the library and not exposed. Users identify connections through `conn_entity` handles, not file descriptors. This handle provides zero-lookup correlation between any read/write result and the connection it belongs to.
+The `fd` component is internal to the library and not exposed. Users identify connections through entity handles (`conn_entity` and `user_conn_entity`), not file descriptors. The last two components provide zero-lookup correlation: any read or write result entity carries handles to both the internal connection and the user's connection entity.
 
 ## Entity lifetimes
+
+### Connection entity (user's `connection_results`)
+
+```
+accept
+  └─► entity created in connection_results (2-phase: begin → end)
+      │
+      ├─ lives until disconnect or user-initiated close
+      │
+      └─► destroyed by:
+            • the user (after seeing EOF/error in read_results)
+            • the library (if auto_destroy_user_entity is true)
+```
+
+Created on accept via two-phase creation. The user can read the `user_data` component and attach application state. No fd is exposed — connections are identified by entity handle. This entity is long-lived — it persists for the entire connection lifetime. The user is responsible for destroying it after the connection ends (unless `auto_destroy_user_entity` is set).
 
 ### Internal connection entity (`connections`)
 
@@ -94,16 +108,17 @@ The `fd` component is internal to the library and not exposed. Users identify co
 accept
   └─► entity created in connections (immediate)
       │
-      ├─ carries: fd (internal), read_cycle_entity (internal)
+      ├─ carries: fd, user_conn_entity, read_cycle_entity (internal)
       │
       └─► destroyed by:
             • the user (to initiate close)
             • on_leave callback fires:
                 • destroys the read-cycle entity
+                • optionally destroys user's connection entity
             • fd destructor fires: releases fixed-file slot
 ```
 
-Created on accept. The user destroys this entity to close a connection. The `on_leave` callback handles cascading cleanup. Users can register `on_enter` on this collection to react to new connections (e.g. initialize per-connection state keyed by entity handle).
+Created on accept alongside the user connection entity. The user destroys this entity to close a connection. The `on_leave` callback handles cascading cleanup.
 
 ### Read-cycle entity
 
@@ -123,7 +138,7 @@ accept
             on_leave destroys this entity if still alive
 ```
 
-One read-cycle entity exists per connection. It cycles between `read_pending` (internal), the user's `read_results`, and `read_in` (library-owned). It carries `conn_entity` for correlation.
+One read-cycle entity exists per connection. It cycles between `read_pending` (internal), the user's `read_results`, and `read_in` (library-owned). It carries `conn_entity` and `user_conn_entity` for correlation.
 
 **Important**: after consuming data from `read_results`, the user must move the entity to `read_in` to re-arm recv. Failing to do so stalls reads on that connection.
 
@@ -131,7 +146,7 @@ One read-cycle entity exists per connection. It cycles between `read_pending` (i
 
 ```
 user creates entity in write_in
-  │   (set write_buf.data, write_buf.len, conn_entity)
+  │   (set fd, write_buf.data, write_buf.len, conn_entity, user_conn_entity)
   │
   ├─► library arms send, moves to write_pending
   │
@@ -153,13 +168,16 @@ There are two paths:
 **Remote disconnect** (EOF or error on recv):
 1. Read-cycle entity moves to `read_results` with `io_result.error` set (0 for EOF, negative for error) and `read_buf.len == 0`
 2. User sees the error, destroys the read-cycle entity
-3. User destroys the `connections` entity (via `conn_entity` handle) to release the slot
+3. User destroys the `connections` entity to release the slot
+4. User destroys the `connection_results` entity to clean up application state
 
 **User-initiated close**:
 1. User destroys the `connections` entity
 2. `on_leave` callback destroys the read-cycle entity (returns any held buffer)
 3. `fd` destructor releases the fixed-file slot
 4. Any in-flight recv/send CQEs are filtered by staleness checks
+
+If `auto_destroy_user_entity` is set in the config, the library automatically destroys the user's `connection_results` entity when the `connections` entity is destroyed.
 
 ## API reference
 
@@ -200,8 +218,10 @@ Creates the sio context. Validates that user-provided collections contain the re
 | `buf_size` | Size of each receive buffer in bytes |
 | `max_connections` | Maximum concurrent connections (fixed-file pool size) |
 | `ring_entries` | io_uring queue depth |
+| `connection_results` | User collection for new connections |
 | `read_results` | User collection for read completions |
 | `write_results` | User collection for write completions |
+| `auto_destroy_user_entity` | Auto-destroy user connection entity on disconnect |
 
 ### `sio_context_destroy`
 
@@ -217,7 +237,7 @@ Tears down io_uring, frees buffers, closes the listen socket.
 sio_result_t sio_listen(sio_context_t *ctx, uint16_t port, int backlog);
 ```
 
-Opens a non-blocking TCP socket, binds to `INADDR_ANY:port`, and arms a multishot accept. Each accepted connection creates entities in `connections` and `read_pending`.
+Opens a non-blocking TCP socket, binds to `INADDR_ANY:port`, and arms a multishot accept. Each accepted connection creates entities in `connection_results`, `connections`, and `read_pending`.
 
 ### `sio_poll`
 

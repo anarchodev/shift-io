@@ -79,12 +79,14 @@ struct sio_context {
   shift_component_id_t      comp_fd;
   shift_component_id_t      comp_read_cycle_entity;
   /* User-provided result collections */
+  shift_collection_id_t     coll_connection_results;
   shift_collection_id_t     coll_read_results;
   shift_collection_id_t     coll_write_results;
   /* Internal collections */
   shift_collection_id_t     coll_read_pending; /* recv armed, waiting for data */
   shift_collection_id_t     coll_write_pending;/* send SQE submitted, waiting for CQE */
   shift_collection_id_t     coll_write_retry;  /* partial send, retried next poll */
+  bool                      auto_destroy_user_entity;
   /* Batched fixed-file slot releases — flushed at the top of sio_poll */
   uint32_t                 *pending_releases;      /* slot indices, size max_connections */
   uint32_t                  pending_release_count;
