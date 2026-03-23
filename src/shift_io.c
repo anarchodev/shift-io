@@ -8,13 +8,6 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-/* --------------------------------------------------------------------------
- * Module-static context pointer used by destructors and callbacks.
- * A single sio_context per process is the expected usage.
- * -------------------------------------------------------------------------- */
-
-static sio_context_t *g_sio_ctx_for_destructor = NULL;
-
 static void sio_release_slot(sio_context_t *ctx, int slot);
 
 /* --------------------------------------------------------------------------
@@ -25,9 +18,10 @@ static void sio_release_slot(sio_context_t *ctx, int slot);
 
 static void fd_destructor(shift_t *sh, shift_collection_id_t col_id,
                           const shift_entity_t *entities, void *data,
-                          uint32_t offset, uint32_t count) {
+                          uint32_t offset, uint32_t count,
+                          void *user_data) {
   (void)sh; (void)entities;
-  sio_context_t *ctx = g_sio_ctx_for_destructor;
+  sio_context_t *ctx = user_data;
   if (!ctx)
     return;
 
@@ -52,9 +46,10 @@ static void fd_destructor(shift_t *sh, shift_collection_id_t col_id,
 
 static void read_buf_destructor(shift_t *sh, shift_collection_id_t col_id,
                                 const shift_entity_t *entities, void *data,
-                                uint32_t offset, uint32_t count) {
+                                uint32_t offset, uint32_t count,
+                                void *user_data) {
   (void)sh; (void)col_id; (void)entities;
-  sio_context_t *ctx = g_sio_ctx_for_destructor;
+  sio_context_t *ctx = user_data;
   if (!ctx)
     return;
 
@@ -411,9 +406,17 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
   }
 
   /* Initialise io_uring */
-  if (io_uring_queue_init(cfg->ring_entries, &ctx->ring, 0) < 0) {
-    err = sio_error_io;
-    goto cleanup_pending;
+  if (cfg->ring_params) {
+    if (io_uring_queue_init_params(cfg->ring_entries, &ctx->ring,
+                                   cfg->ring_params) < 0) {
+      err = sio_error_io;
+      goto cleanup_pending;
+    }
+  } else {
+    if (io_uring_queue_init(cfg->ring_entries, &ctx->ring, 0) < 0) {
+      err = sio_error_io;
+      goto cleanup_pending;
+    }
   }
   ctx->ring_initialized = true;
 
@@ -455,8 +458,9 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
   }
   io_uring_buf_ring_advance(ctx->buf_ring, (int)cfg->buf_count);
 
-  /* Expose context to destructors and callbacks */
-  g_sio_ctx_for_destructor = ctx;
+  /* Expose context to component destructors via user_data */
+  shift_component_set_user_data(ctx->shift, ctx->comp_ids.read_buf, ctx);
+  shift_component_set_user_data(ctx->shift, ctx->comp_fd, ctx);
 
   *out = ctx;
   return sio_ok;
@@ -484,9 +488,6 @@ cleanup_ctx:
 void sio_context_destroy(sio_context_t *ctx) {
   if (!ctx)
     return;
-
-  if (g_sio_ctx_for_destructor == ctx)
-    g_sio_ctx_for_destructor = NULL;
 
   if (ctx->listen_fd >= 0) {
     close(ctx->listen_fd);
@@ -714,6 +715,7 @@ sio_result_t sio_listen(sio_context_t *ctx, uint16_t port, int backlog) {
 
   int one = 1;
   setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+  setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &one, sizeof(one));
 
   struct sockaddr_in addr = {
       .sin_family      = AF_INET,

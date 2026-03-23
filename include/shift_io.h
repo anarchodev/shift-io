@@ -1,6 +1,8 @@
 #pragma once
 
 #include <shift.h>
+struct io_uring_params;
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -89,6 +91,12 @@ typedef struct {
   /* When true, the library destroys the user's connection_results entity
    * automatically when the connection disconnects (EOF or error). */
   bool auto_destroy_user_entity;
+  /* Optional io_uring params.  When non-NULL the library uses
+   * io_uring_queue_init_params() instead of io_uring_queue_init(),
+   * allowing the caller to set flags like IORING_SETUP_SQPOLL and
+   * sq_thread_cpu.  The struct is read/written (kernel fills output
+   * fields).  NULL = default (flags 0). */
+  struct io_uring_params *ring_params;
 } sio_config_t;
 
 /* --------------------------------------------------------------------------

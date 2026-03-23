@@ -1,15 +1,21 @@
+#define _GNU_SOURCE
+
 #include <shift_io.h>
 #include <shift.h>
+#include <liburing.h>
 
+#include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #define PORT            7777
-#define BACKLOG         128
-#define MAX_CONNECTIONS 4096
-#define BUF_COUNT       64
+#define BACKLOG         4096
+#define MAX_CONNECTIONS 16384
+#define BUF_COUNT       16384
 #define BUF_SIZE        4096
 
 static volatile bool g_running = true;
@@ -19,61 +25,54 @@ static void handle_signal(int sig) {
   g_running = false;
 }
 
-/*
- * Echo server — demonstrates the user-provided collection model.
- *
- * Setup:
- *   1. sio_register_components() — get component IDs
- *   2. Create user-owned result collections with those IDs
- *   3. sio_context_create() — pass component IDs + collection IDs
- *
- * Connection lifecycle:
- *   accept → connection_results (user sees new connection)
- *          → connections (user destroys to close)
- *          → read_pending (internal, recv armed)
- *
- * Read cycle:
- *   read_pending → read_results (user sees data/EOF/error)
- *               → read_in (user done) → read_pending → …
- *
- * Write cycle:
- *   echo_pending (app staging) → write_in → write_pending
- *                              → write_results (user sees completion)
- *
- * Close:
- *   User destroys entity from connections collection.
- */
+typedef struct {
+  int worker_id;
+  int worker_core;
+  int sq_core;
+} worker_config_t;
 
-int main(void) {
-  signal(SIGINT, handle_signal);
-  signal(SIGTERM, handle_signal);
+static void pin_to_core(int core) {
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  CPU_SET(core, &cpuset);
+  pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
+}
 
+static void *worker_fn(void *arg) {
+  worker_config_t *cfg = arg;
+
+  pin_to_core(cfg->worker_core);
+  printf("Worker %d: pinned to core %d, io_uring SQPOLL on core %d\n",
+         cfg->worker_id, cfg->worker_core, cfg->sq_core);
+
+  /* ---- Create per-worker shift context ---- */
   shift_t       *sh     = NULL;
   shift_config_t sh_cfg = {
-      .max_entities            = MAX_CONNECTIONS * 4,
+      .max_entities            = MAX_CONNECTIONS * 6,
       .max_components          = 16,
       .max_collections         = 24,
-      .deferred_queue_capacity = MAX_CONNECTIONS * 4,
+      .deferred_queue_capacity = MAX_CONNECTIONS * 6,
       .allocator               = {NULL, NULL, NULL, NULL},
   };
   if (shift_context_create(&sh_cfg, &sh) != shift_ok) {
-    fprintf(stderr, "shift_context_create failed\n");
-    return 1;
+    fprintf(stderr, "Worker %d: shift_context_create failed\n", cfg->worker_id);
+    return NULL;
   }
 
   /* Phase 1: register sio components */
   sio_component_ids_t comp_ids;
   if (sio_register_components(sh, &comp_ids) != sio_ok) {
-    fprintf(stderr, "sio_register_components failed\n");
+    fprintf(stderr, "Worker %d: sio_register_components failed\n",
+            cfg->worker_id);
     shift_context_destroy(sh);
-    return 1;
+    return NULL;
   }
 
-  /* Phase 2: create user-owned result collections using sio component IDs */
+  /* Phase 2: create user-owned result collections */
   shift_collection_id_t connection_results_coll;
   {
-    shift_component_id_t comps[] = {comp_ids.conn_entity};
-    shift_collection_info_t info = {.comp_ids = comps, .comp_count = 1};
+    shift_component_id_t    comps[] = {comp_ids.conn_entity};
+    shift_collection_info_t info    = {.comp_ids = comps, .comp_count = 1};
     shift_collection_register(sh, &info, &connection_results_coll);
   }
 
@@ -95,7 +94,13 @@ int main(void) {
     shift_collection_register(sh, &info, &write_results_coll);
   }
 
-  /* Phase 3: create sio context with pre-registered components + user collections */
+  /* Phase 3: create sio context with SQPOLL pinned to adjacent core */
+  struct io_uring_params ring_params = {
+      .flags        = IORING_SETUP_SQPOLL | IORING_SETUP_SQ_AFF,
+      .sq_thread_cpu = (uint32_t)cfg->sq_core,
+      .sq_thread_idle = 1000, /* ms before kernel parks the SQ thread */
+  };
+
   sio_context_t *ctx     = NULL;
   sio_config_t   sio_cfg = {
       .shift              = sh,
@@ -103,46 +108,39 @@ int main(void) {
       .buf_count          = BUF_COUNT,
       .buf_size           = BUF_SIZE,
       .max_connections    = MAX_CONNECTIONS,
-      .ring_entries       = 256,
+      .ring_entries       = 4096,
       .connection_results = connection_results_coll,
       .read_results       = read_results_coll,
       .write_results      = write_results_coll,
       .auto_destroy_user_entity = false,
+      .ring_params        = &ring_params,
   };
   if (sio_context_create(&sio_cfg, &ctx) != sio_ok) {
-    fprintf(stderr, "sio_context_create failed\n");
+    fprintf(stderr, "Worker %d: sio_context_create failed\n", cfg->worker_id);
     shift_context_destroy(sh);
-    return 1;
+    return NULL;
   }
 
   const sio_collection_ids_t *coll_ids = sio_get_collection_ids(ctx);
 
-  /* Register echo_pending staging collection with write-side components */
-  SHIFT_COLLECTION(sh, echo_pending_coll, comp_ids.write_buf,
-                   comp_ids.io_result, comp_ids.conn_entity,
-                   comp_ids.user_conn_entity);
-
   if (sio_listen(ctx, PORT, BACKLOG) != sio_ok) {
-    fprintf(stderr, "sio_listen failed on port %d\n", PORT);
+    fprintf(stderr, "Worker %d: sio_listen failed on port %d\n",
+            cfg->worker_id, PORT);
     sio_context_destroy(ctx);
     shift_context_destroy(sh);
-    return 1;
+    return NULL;
   }
 
-  printf("Echo server listening on port %d\n", PORT);
-
-  bool poll_error = false;
+  /* ---- Event loop ---- */
   while (g_running) {
     sio_result_t poll_result = sio_poll(ctx, 1);
     if (poll_result != sio_ok) {
-      fprintf(stderr, "sio_poll failed (%d), aborting\n", poll_result);
-      poll_error = true;
+      fprintf(stderr, "Worker %d: sio_poll failed (%d)\n", cfg->worker_id,
+              poll_result);
       break;
     }
 
-    /* ------------------------------------------------------------------ */
-    /* Process read_results: create echo write jobs or handle close.       */
-    /* ------------------------------------------------------------------ */
+    /* Process read_results: echo back or handle close */
     {
       shift_entity_t         *ro_entities = NULL;
       sio_read_buf_t         *ro_rbufs    = NULL;
@@ -167,79 +165,49 @@ int main(void) {
                                            (void **)&ro_uconns, NULL);
 
       for (size_t i = 0; i < ro_count; i++) {
-        /* Connection closed or error */
         if (ro_results[i].error != 0 || ro_rbufs[i].len == 0) {
           shift_entity_destroy_one(sh, ro_entities[i]);
-          /* Destroy connections entity → on_leave releases slot */
           if (!shift_entity_is_stale(sh, ro_conns[i].entity))
             shift_entity_destroy_one(sh, ro_conns[i].entity);
-          /* Destroy user connection entity */
           if (!shift_entity_is_stale(sh, ro_uconns[i].entity))
             shift_entity_destroy_one(sh, ro_uconns[i].entity);
           continue;
         }
 
-        /* Create echo write job in staging collection */
-        shift_entity_t ep_entity;
-        if (shift_entity_create_one_immediate(sh, echo_pending_coll,
-                                              &ep_entity) != shift_ok) {
+        shift_entity_t wi_entity;
+        if (shift_entity_create_one_begin(sh, coll_ids->write_in,
+                                          &wi_entity) != shift_ok) {
           shift_entity_move_one(sh, ro_entities[i], coll_ids->read_in);
           continue;
         }
 
-        /* Copy connection handles for correlation */
-        sio_conn_entity_t *ep_ce = NULL;
-        shift_entity_get_component(sh, ep_entity, comp_ids.conn_entity,
-                                   (void **)&ep_ce);
-        ep_ce->entity = ro_conns[i].entity;
+        sio_conn_entity_t *wi_ce = NULL;
+        shift_entity_get_component(sh, wi_entity, comp_ids.conn_entity,
+                                   (void **)&wi_ce);
+        wi_ce->entity = ro_conns[i].entity;
 
-        sio_user_conn_entity_t *ep_uce = NULL;
-        shift_entity_get_component(sh, ep_entity, comp_ids.user_conn_entity,
-                                   (void **)&ep_uce);
-        ep_uce->entity = ro_uconns[i].entity;
+        sio_user_conn_entity_t *wi_uce = NULL;
+        shift_entity_get_component(sh, wi_entity, comp_ids.user_conn_entity,
+                                   (void **)&wi_uce);
+        wi_uce->entity = ro_uconns[i].entity;
 
-        /* Malloc and copy received data */
-        sio_write_buf_t *ep_wb = NULL;
-        shift_entity_get_component(sh, ep_entity, comp_ids.write_buf,
-                                   (void **)&ep_wb);
+        sio_write_buf_t *wi_wb = NULL;
+        shift_entity_get_component(sh, wi_entity, comp_ids.write_buf,
+                                   (void **)&wi_wb);
         uint32_t len  = ro_rbufs[i].len;
         void    *copy = malloc(len);
         if (copy) {
           memcpy(copy, ro_rbufs[i].data, len);
-          ep_wb->data = copy;
-          ep_wb->len  = len;
+          wi_wb->data = copy;
+          wi_wb->len  = len;
         }
 
-        /* Return read-cycle entity for re-arming */
+        shift_entity_create_one_end(sh, wi_entity);
         shift_entity_move_one(sh, ro_entities[i], coll_ids->read_in);
       }
     }
 
-    /* ------------------------------------------------------------------ */
-    /* Process echo_pending: move ready writes into write_in.              */
-    /* ------------------------------------------------------------------ */
-    {
-      shift_entity_t  *ep_entities = NULL;
-      sio_write_buf_t *ep_wbufs    = NULL;
-      size_t           ep_count    = 0;
-
-      shift_collection_get_entities(sh, echo_pending_coll, &ep_entities,
-                                    &ep_count);
-      shift_collection_get_component_array(sh, echo_pending_coll,
-                                           comp_ids.write_buf,
-                                           (void **)&ep_wbufs, NULL);
-
-      for (size_t i = 0; i < ep_count; i++) {
-        if (ep_wbufs[i].data)
-          shift_entity_move_one(sh, ep_entities[i], coll_ids->write_in);
-        else
-          shift_entity_destroy_one(sh, ep_entities[i]);
-      }
-    }
-
-    /* ------------------------------------------------------------------ */
-    /* Process write_results: free buffers, destroy entities.              */
-    /* ------------------------------------------------------------------ */
+    /* Process write_results: free buffers, destroy entities */
     {
       shift_entity_t  *wo_entities = NULL;
       sio_write_buf_t *wo_wbufs    = NULL;
@@ -260,9 +228,52 @@ int main(void) {
     shift_flush(sh);
   }
 
-  printf("\nShutting down.\n");
-
   sio_context_destroy(ctx);
   shift_context_destroy(sh);
-  return poll_error ? 1 : 0;
+  return NULL;
+}
+
+/*
+ * Multithreaded echo server — share-nothing workers.
+ *
+ * Spawns N worker threads (N = num_cores / 2, or argv[1]).
+ * Each worker is pinned to an even core (0, 2, 4, …) and its io_uring
+ * SQPOLL thread is pinned to the adjacent odd core (1, 3, 5, …) so
+ * they share L1/L2 cache.  Each worker has its own shift + sio context
+ * and listens on the same port via SO_REUSEPORT.
+ */
+int main(int argc, char **argv) {
+  signal(SIGINT, handle_signal);
+  signal(SIGTERM, handle_signal);
+
+  long ncpus = sysconf(_SC_NPROCESSORS_ONLN);
+  int  nworkers = (int)(ncpus / 2);
+  if (argc > 1)
+    nworkers = atoi(argv[1]);
+  if (nworkers < 1)
+    nworkers = 1;
+  if (nworkers > (int)(ncpus / 2) && ncpus >= 2)
+    nworkers = (int)(ncpus / 2);
+
+  printf("Echo server: %d workers on %ld cores, port %d\n", nworkers, ncpus,
+         PORT);
+
+  worker_config_t *configs = calloc((size_t)nworkers, sizeof(worker_config_t));
+  pthread_t       *threads = calloc((size_t)nworkers, sizeof(pthread_t));
+
+  for (int i = 0; i < nworkers; i++) {
+    configs[i].worker_id   = i;
+    configs[i].worker_core = i * 2;
+    configs[i].sq_core     = i * 2 + 1;
+    pthread_create(&threads[i], NULL, worker_fn, &configs[i]);
+  }
+
+  for (int i = 0; i < nworkers; i++)
+    pthread_join(threads[i], NULL);
+
+  printf("\nShutting down.\n");
+
+  free(threads);
+  free(configs);
+  return 0;
 }
