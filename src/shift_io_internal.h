@@ -22,21 +22,24 @@ constexpr uint16_t SIO_BUF_GROUP_ID = 0;
 /* --------------------------------------------------------------------------
  * SQE user_data encoding
  *
- * ACCEPT:    SIO_UD_ACCEPT sentinel (UINT64_MAX — no entity)
- * RECV/SEND: generation in bits[63:32] | index in bits[31:0]
+ * ACCEPT:      SIO_UD_ACCEPT   sentinel (UINT64_MAX — no entity)
+ * INTERNAL:    SIO_UD_INTERNAL sentinel (UINT64_MAX-1 — fire-and-forget)
+ * RECV/SEND:   generation in bits[63:32] | index in bits[31:0]
  *
  * CQE dispatch uses the entity's collection membership (write_pending vs
  * read_pending) rather than a discriminator bit. sio_poll flushes all
  * deferred moves before submit_and_wait so col_id is always current.
  * -------------------------------------------------------------------------- */
 
-#define SIO_UD_ACCEPT UINT64_MAX
+#define SIO_UD_ACCEPT   UINT64_MAX
+#define SIO_UD_INTERNAL (UINT64_MAX - 1)
 
 static inline uint64_t sio_encode_ud(shift_entity_t e) {
   return (uint64_t)e.generation << 32 | e.index;
 }
 
-static inline bool sio_ud_is_accept(uint64_t ud) { return ud == UINT64_MAX; }
+static inline bool sio_ud_is_accept(uint64_t ud)   { return ud == SIO_UD_ACCEPT; }
+static inline bool sio_ud_is_internal(uint64_t ud) { return ud == SIO_UD_INTERNAL; }
 
 static inline shift_entity_t sio_ud_entity(uint64_t ud) {
   return (shift_entity_t){

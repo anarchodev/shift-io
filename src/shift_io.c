@@ -3,6 +3,7 @@
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
@@ -783,6 +784,20 @@ static sio_result_t sio_handle_accept_cqe(sio_context_t       *ctx,
                              (void **)&conn_fd);
   conn_fd->fd = new_slot;
 
+  /* Set TCP_NODELAY on the accepted socket to disable Nagle's algorithm.
+   * Uses io_uring cmd_sock since new_slot is a direct descriptor. */
+  {
+    static int one = 1;
+    struct io_uring_sqe *nodelay_sqe = io_uring_get_sqe(&ctx->ring);
+    if (nodelay_sqe) {
+      io_uring_prep_cmd_sock(nodelay_sqe, SOCKET_URING_OP_SETSOCKOPT,
+                             new_slot, IPPROTO_TCP, TCP_NODELAY,
+                             &one, sizeof(one));
+      nodelay_sqe->flags |= IOSQE_FIXED_FILE;
+      io_uring_sqe_set_data64(nodelay_sqe, SIO_UD_INTERNAL);
+    }
+  }
+
   /* Step 2: 2-phase create entity in user's connection_results.
    * Created after the connections entity so we can set conn_entity
    * between begin and end. */
@@ -962,7 +977,9 @@ static sio_result_t sio_submit_and_drain(sio_context_t *ctx,
 
   io_uring_for_each_cqe(&ctx->ring, head, cqe) {
     uint64_t ud = io_uring_cqe_get_data64(cqe);
-    if (sio_ud_is_accept(ud)) {
+    if (sio_ud_is_internal(ud)) {
+      /* fire-and-forget (e.g. TCP_NODELAY setsockopt) — ignore */
+    } else if (sio_ud_is_accept(ud)) {
       if (sio_handle_accept_cqe(ctx, cqe) != sio_ok)
         result = sio_error_io;
     } else {
