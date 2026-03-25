@@ -72,7 +72,7 @@ static void *worker_fn(void *arg) {
   shift_collection_id_t connection_results_coll;
   {
     shift_component_id_t    comps[] = {comp_ids.conn_entity};
-    shift_collection_info_t info    = {.comp_ids = comps, .comp_count = 1};
+    shift_collection_info_t info    = {.name = "connection_results", .comp_ids = comps, .comp_count = 1};
     shift_collection_register(sh, &info, &connection_results_coll);
   }
 
@@ -81,7 +81,7 @@ static void *worker_fn(void *arg) {
     shift_component_id_t comps[] = {comp_ids.read_buf, comp_ids.io_result,
                                     comp_ids.conn_entity,
                                     comp_ids.user_conn_entity};
-    shift_collection_info_t info = {.comp_ids = comps, .comp_count = 4};
+    shift_collection_info_t info = {.name = "read_results", .comp_ids = comps, .comp_count = 4};
     shift_collection_register(sh, &info, &read_results_coll);
   }
 
@@ -90,7 +90,7 @@ static void *worker_fn(void *arg) {
     shift_component_id_t comps[] = {comp_ids.write_buf, comp_ids.io_result,
                                     comp_ids.conn_entity,
                                     comp_ids.user_conn_entity};
-    shift_collection_info_t info = {.comp_ids = comps, .comp_count = 4};
+    shift_collection_info_t info = {.name = "write_results", .comp_ids = comps, .comp_count = 4};
     shift_collection_register(sh, &info, &write_results_coll);
   }
 

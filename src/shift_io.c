@@ -321,6 +321,7 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
                                          ctx->comp_ids.user_conn_entity,
                                          ctx->comp_read_cycle_entity};
     shift_collection_info_t conn_info = {
+        .name       = "connections",
         .comp_ids   = conn_comps,
         .comp_count = 3,
         .max_capacity = 0,
@@ -347,6 +348,7 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
 
   {
     shift_collection_info_t read_pending_info = {
+        .name       = "read_pending",
         .comp_ids   = read_comps,
         .comp_count = 5,
         .max_capacity = 0,
@@ -358,6 +360,7 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
 
   {
     shift_collection_info_t read_in_info = {
+        .name       = "read_in",
         .comp_ids   = read_comps,
         .comp_count = 5,
         .max_capacity = 0,
@@ -375,6 +378,7 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
 
   {
     shift_collection_info_t write_in_info = {
+        .name       = "write_in",
         .comp_ids   = write_comps,
         .comp_count = 5,
         .max_capacity = 0,
@@ -386,6 +390,7 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
 
   {
     shift_collection_info_t write_pending_info = {
+        .name       = "write_pending",
         .comp_ids   = write_comps,
         .comp_count = 5,
         .max_capacity = 0,
@@ -397,6 +402,7 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
 
   {
     shift_collection_info_t write_retry_info = {
+        .name       = "write_retry",
         .comp_ids   = write_comps,
         .comp_count = 5,
         .max_capacity = 0,

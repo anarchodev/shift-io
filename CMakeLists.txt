@@ -10,7 +10,7 @@ include(FetchContent)
 FetchContent_Declare(
     shift
     GIT_REPOSITORY https://github.com/anarchodev/shift.git
-    GIT_TAG 062d936
+    GIT_TAG 9eb45c7
 )
 FetchContent_MakeAvailable(shift)
 
