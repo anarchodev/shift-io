@@ -94,4 +94,9 @@ struct sio_context {
   uint32_t                 *pending_releases;      /* slot indices, size max_connections */
   uint32_t                  pending_release_count;
   int                      *release_minus_one;     /* all-(-1) scratch, size max_connections */
+  /* Outbound connection support */
+  bool                      has_connect;
+  shift_collection_id_t     coll_connect_results;
+  shift_collection_id_t     coll_connect_socket_pending;
+  shift_collection_id_t     coll_connect_pending;
 };

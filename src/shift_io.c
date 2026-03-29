@@ -123,6 +123,11 @@ static sio_result_t sio_handle_accept_cqe(sio_context_t       *ctx,
                                           struct io_uring_cqe *cqe);
 static void sio_handle_recv_cqe(sio_context_t *ctx, struct io_uring_cqe *cqe);
 static void sio_handle_send_cqe(sio_context_t *ctx, struct io_uring_cqe *cqe);
+static void sio_drain_connect_in(sio_context_t *ctx);
+static void sio_handle_connect_socket_cqe(sio_context_t       *ctx,
+                                          struct io_uring_cqe *cqe);
+static void sio_handle_connect_cqe(sio_context_t       *ctx,
+                                   struct io_uring_cqe *cqe);
 
 /* --------------------------------------------------------------------------
  * sio_collection_has_components (static)
@@ -194,6 +199,12 @@ sio_result_t sio_register_components(shift_t *sh, sio_component_ids_t *out) {
   };
   if (shift_component_register(sh, &uce_info, &out->user_conn_entity) !=
       shift_ok)
+    return sio_error_invalid;
+
+  shift_component_info_t ca_info = {
+      .element_size = sizeof(sio_connect_addr_t),
+  };
+  if (shift_component_register(sh, &ca_info, &out->connect_addr) != shift_ok)
     return sio_error_invalid;
 
   return sio_ok;
@@ -410,6 +421,71 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
     if (shift_collection_register(ctx->shift, &write_retry_info,
                                   &ctx->coll_write_retry) != shift_ok)
       goto cleanup_pending;
+  }
+
+  /* Optional: outbound connection support */
+  if (cfg->enable_connect) {
+    /* Validate connect_results has required components:
+     *   {io_result, conn_entity, user_conn_entity} */
+    shift_component_id_t cr_req[3] = {ctx->comp_ids.io_result,
+                                      ctx->comp_ids.conn_entity,
+                                      ctx->comp_ids.user_conn_entity};
+    for (int i = 1; i < 3; i++) {
+      shift_component_id_t key = cr_req[i];
+      int                  j   = i - 1;
+      while (j >= 0 && cr_req[j] > key) {
+        cr_req[j + 1] = cr_req[j];
+        j--;
+      }
+      cr_req[j + 1] = key;
+    }
+    if (!sio_collection_has_components(ctx->shift, cfg->connect_results,
+                                      cr_req, 3))
+      goto cleanup_pending;
+
+    ctx->coll_connect_results = cfg->connect_results;
+
+    /* connect_in, connect_socket_pending, connect_pending all carry the same
+     * components so entities can move freely between them. */
+    shift_component_id_t connect_comps[] = {
+        ctx->comp_fd, ctx->comp_ids.connect_addr, ctx->comp_ids.io_result,
+        ctx->comp_ids.conn_entity, ctx->comp_ids.user_conn_entity};
+
+    {
+      shift_collection_info_t ci_info = {
+          .name       = "connect_in",
+          .comp_ids   = connect_comps,
+          .comp_count = 5,
+      };
+      if (shift_collection_register(ctx->shift, &ci_info,
+                                    &ctx->coll_ids.connect_in) != shift_ok)
+        goto cleanup_pending;
+    }
+
+    {
+      shift_collection_info_t csp_info = {
+          .name       = "connect_socket_pending",
+          .comp_ids   = connect_comps,
+          .comp_count = 5,
+      };
+      if (shift_collection_register(ctx->shift, &csp_info,
+                                    &ctx->coll_connect_socket_pending) !=
+          shift_ok)
+        goto cleanup_pending;
+    }
+
+    {
+      shift_collection_info_t cp_info = {
+          .name       = "connect_pending",
+          .comp_ids   = connect_comps,
+          .comp_count = 5,
+      };
+      if (shift_collection_register(ctx->shift, &cp_info,
+                                    &ctx->coll_connect_pending) != shift_ok)
+        goto cleanup_pending;
+    }
+
+    ctx->has_connect = true;
   }
 
   /* Initialise io_uring */
@@ -875,6 +951,231 @@ static sio_result_t sio_handle_accept_cqe(sio_context_t       *ctx,
 }
 
 /* --------------------------------------------------------------------------
+ * sio_drain_connect_in (static)
+ * For each entity in connect_in, submit a socket_direct_alloc SQE and move
+ * the entity to connect_socket_pending.
+ * -------------------------------------------------------------------------- */
+
+static void sio_drain_connect_in(sio_context_t *ctx) {
+  shift_entity_t *entities = NULL;
+  size_t          count    = 0;
+
+  shift_collection_get_entities(ctx->shift, ctx->coll_ids.connect_in,
+                                &entities, &count);
+
+  for (size_t i = 0; i < count; i++) {
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ctx->ring);
+    if (!sqe)
+      break;
+
+    io_uring_prep_socket_direct_alloc(
+        sqe, AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, 0);
+    io_uring_sqe_set_data64(sqe, sio_encode_ud(entities[i]));
+    shift_entity_move_one(ctx->shift, entities[i],
+                          ctx->coll_connect_socket_pending);
+  }
+}
+
+/* --------------------------------------------------------------------------
+ * sio_handle_connect_socket_cqe (static)
+ *
+ * Socket creation for an outbound connect completed.  On success, store the
+ * allocated fixed-file slot, submit the connect SQE + TCP_NODELAY, and move
+ * the entity to connect_pending.  On failure, set io_result and move to
+ * connect_results.
+ * -------------------------------------------------------------------------- */
+
+static void sio_handle_connect_socket_cqe(sio_context_t       *ctx,
+                                          struct io_uring_cqe *cqe) {
+  shift_entity_t entity = sio_ud_entity(io_uring_cqe_get_data64(cqe));
+
+  if (shift_entity_is_stale(ctx->shift, entity))
+    return;
+
+  int slot = cqe->res;
+  if (slot < 0) {
+    /* Socket creation failed — surface error to user */
+    sio_io_result_t *ir = NULL;
+    shift_entity_get_component(ctx->shift, entity, ctx->comp_ids.io_result,
+                               (void **)&ir);
+    ir->error = slot;
+    shift_entity_move_one(ctx->shift, entity, ctx->coll_connect_results);
+    return;
+  }
+
+  /* Store the allocated slot */
+  sio_fd_t *fd = NULL;
+  shift_entity_get_component(ctx->shift, entity, ctx->comp_fd,
+                             (void **)&fd);
+  fd->fd = slot;
+
+  /* Set TCP_NODELAY */
+  {
+    static int               one         = 1;
+    struct io_uring_sqe *nodelay_sqe = io_uring_get_sqe(&ctx->ring);
+    if (nodelay_sqe) {
+      io_uring_prep_cmd_sock(nodelay_sqe, SOCKET_URING_OP_SETSOCKOPT, slot,
+                             IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+      nodelay_sqe->flags |= IOSQE_FIXED_FILE;
+      io_uring_sqe_set_data64(nodelay_sqe, SIO_UD_INTERNAL);
+    }
+  }
+
+  /* Submit connect SQE */
+  struct io_uring_sqe *sqe = io_uring_get_sqe(&ctx->ring);
+  if (!sqe) {
+    sio_release_slot(ctx, slot);
+    sio_io_result_t *ir = NULL;
+    shift_entity_get_component(ctx->shift, entity, ctx->comp_ids.io_result,
+                               (void **)&ir);
+    ir->error = -EAGAIN;
+    shift_entity_move_one(ctx->shift, entity, ctx->coll_connect_results);
+    return;
+  }
+
+  sio_connect_addr_t *ca = NULL;
+  shift_entity_get_component(ctx->shift, entity, ctx->comp_ids.connect_addr,
+                             (void **)&ca);
+
+  io_uring_prep_connect(sqe, slot, (struct sockaddr *)&ca->addr,
+                        sizeof(ca->addr));
+  sqe->flags |= IOSQE_FIXED_FILE;
+  io_uring_sqe_set_data64(sqe, sio_encode_ud(entity));
+  shift_entity_move_one(ctx->shift, entity, ctx->coll_connect_pending);
+}
+
+/* --------------------------------------------------------------------------
+ * sio_handle_connect_cqe (static)
+ *
+ * Async connect completed.  On success, set up the full connection (same as
+ * accept): connections entity, user connection_results entity, read-cycle
+ * entity, and arm recv.  Set io_result / conn_entity / user_conn_entity on
+ * the connect entity and move it to connect_results.
+ * -------------------------------------------------------------------------- */
+
+static void sio_handle_connect_cqe(sio_context_t       *ctx,
+                                   struct io_uring_cqe *cqe) {
+  shift_entity_t entity = sio_ud_entity(io_uring_cqe_get_data64(cqe));
+
+  if (shift_entity_is_stale(ctx->shift, entity))
+    return;
+
+  sio_fd_t *ent_fd = NULL;
+  shift_entity_get_component(ctx->shift, entity, ctx->comp_fd,
+                             (void **)&ent_fd);
+  int slot = ent_fd->fd;
+
+  sio_io_result_t *ir = NULL;
+  shift_entity_get_component(ctx->shift, entity, ctx->comp_ids.io_result,
+                             (void **)&ir);
+
+  if (cqe->res < 0) {
+    /* Connect failed */
+    sio_release_slot(ctx, slot);
+    ir->error = cqe->res;
+    shift_entity_move_one(ctx->shift, entity, ctx->coll_connect_results);
+    return;
+  }
+
+  /* --- Success: mirror the accept entity-creation flow --- */
+
+  /* Step 1: Create entity in internal connections collection */
+  shift_entity_t conn_entity;
+  if (shift_entity_create_one_immediate(ctx->shift, ctx->coll_ids.connections,
+                                        &conn_entity) != shift_ok) {
+    sio_release_slot(ctx, slot);
+    ir->error = -ENOMEM;
+    shift_entity_move_one(ctx->shift, entity, ctx->coll_connect_results);
+    return;
+  }
+
+  sio_fd_t *conn_fd = NULL;
+  shift_entity_get_component(ctx->shift, conn_entity, ctx->comp_fd,
+                             (void **)&conn_fd);
+  conn_fd->fd = slot;
+
+  /* Step 2: 2-phase create entity in user's connection_results */
+  shift_entity_t user_conn;
+  if (shift_entity_create_one_begin(ctx->shift, ctx->coll_connection_results,
+                                    &user_conn) != shift_ok) {
+    shift_entity_destroy_one(ctx->shift, conn_entity);
+    ir->error = -ENOMEM;
+    shift_entity_move_one(ctx->shift, entity, ctx->coll_connect_results);
+    return;
+  }
+
+  sio_conn_entity_t *user_ce = NULL;
+  shift_entity_get_component(ctx->shift, user_conn, ctx->comp_ids.conn_entity,
+                             (void **)&user_ce);
+  user_ce->entity = conn_entity;
+
+  if (shift_entity_create_one_end(ctx->shift, user_conn) != shift_ok) {
+    shift_entity_destroy_one(ctx->shift, conn_entity);
+    ir->error = -ENOMEM;
+    shift_entity_move_one(ctx->shift, entity, ctx->coll_connect_results);
+    return;
+  }
+
+  /* Store user connection entity handle on connections entity */
+  sio_user_conn_entity_t *uce = NULL;
+  shift_entity_get_component(ctx->shift, conn_entity,
+                             ctx->comp_ids.user_conn_entity, (void **)&uce);
+  uce->entity = user_conn;
+
+  /* Step 3: Create read-cycle entity in read_pending */
+  shift_entity_t read_entity;
+  if (shift_entity_create_one_immediate(ctx->shift, ctx->coll_read_pending,
+                                        &read_entity) != shift_ok) {
+    shift_entity_destroy_one(ctx->shift, conn_entity);
+    shift_entity_destroy_one(ctx->shift, user_conn);
+    ir->error = -ENOMEM;
+    shift_entity_move_one(ctx->shift, entity, ctx->coll_connect_results);
+    return;
+  }
+
+  sio_fd_t *read_fd = NULL;
+  shift_entity_get_component(ctx->shift, read_entity, ctx->comp_fd,
+                             (void **)&read_fd);
+  read_fd->fd = slot;
+
+  sio_conn_entity_t *ce = NULL;
+  shift_entity_get_component(ctx->shift, read_entity,
+                             ctx->comp_ids.conn_entity, (void **)&ce);
+  ce->entity = conn_entity;
+
+  sio_user_conn_entity_t *read_uce = NULL;
+  shift_entity_get_component(ctx->shift, read_entity,
+                             ctx->comp_ids.user_conn_entity,
+                             (void **)&read_uce);
+  read_uce->entity = user_conn;
+
+  /* Store read-cycle entity on connections entity for on_leave cleanup */
+  sio_read_cycle_entity_t *rce = NULL;
+  shift_entity_get_component(ctx->shift, conn_entity,
+                             ctx->comp_read_cycle_entity, (void **)&rce);
+  rce->entity = read_entity;
+
+  /* Arm recv */
+  sio_arm_recv(ctx, slot, read_entity);
+
+  /* Set result on the connect entity and move to connect_results */
+  ir->error = 0;
+
+  sio_conn_entity_t *cr_ce = NULL;
+  shift_entity_get_component(ctx->shift, entity, ctx->comp_ids.conn_entity,
+                             (void **)&cr_ce);
+  cr_ce->entity = conn_entity;
+
+  sio_user_conn_entity_t *cr_uce = NULL;
+  shift_entity_get_component(ctx->shift, entity,
+                             ctx->comp_ids.user_conn_entity,
+                             (void **)&cr_uce);
+  cr_uce->entity = user_conn;
+
+  shift_entity_move_one(ctx->shift, entity, ctx->coll_connect_results);
+}
+
+/* --------------------------------------------------------------------------
  * sio_handle_recv_cqe (static)
  * -------------------------------------------------------------------------- */
 
@@ -993,7 +1294,15 @@ static sio_result_t sio_submit_and_drain(sio_context_t *ctx,
       shift_collection_id_t col_id;
       shift_entity_get_collection(ctx->shift, entity, &col_id);
       if (!shift_entity_is_stale(ctx->shift, entity) &&
-          col_id == ctx->coll_write_pending)
+          ctx->has_connect &&
+          col_id == ctx->coll_connect_socket_pending)
+        sio_handle_connect_socket_cqe(ctx, cqe);
+      else if (!shift_entity_is_stale(ctx->shift, entity) &&
+               ctx->has_connect &&
+               col_id == ctx->coll_connect_pending)
+        sio_handle_connect_cqe(ctx, cqe);
+      else if (!shift_entity_is_stale(ctx->shift, entity) &&
+               col_id == ctx->coll_write_pending)
         sio_handle_send_cqe(ctx, cqe);
       else
         sio_handle_recv_cqe(ctx, cqe);
@@ -1019,6 +1328,11 @@ sio_result_t sio_poll(sio_context_t *ctx, uint32_t min_complete) {
   /* Step 2: drain read_in — return buffers to ring, move back to read_pending,
    * and re-arm recv. */
   sio_drain_read_in(ctx);
+
+  /* Step 2b: drain connect_in — submit socket creation SQEs, move to
+   * connect_socket_pending. */
+  if (ctx->has_connect)
+    sio_drain_connect_in(ctx);
 
   /* Step 3: arm sends — drain write_retry first (partial sends from last tick),
    * then write_in (new sends from the app). */

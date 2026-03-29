@@ -3,6 +3,7 @@
 #include <shift.h>
 struct io_uring_params;
 
+#include <netinet/in.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -48,6 +49,10 @@ typedef struct {
   shift_entity_t entity; /* handle to user's connection_results entity */
 } sio_user_conn_entity_t;
 
+typedef struct {
+  struct sockaddr_in addr; /* target address for outbound connection */
+} sio_connect_addr_t;
+
 /* --------------------------------------------------------------------------
  * Registered IDs
  * -------------------------------------------------------------------------- */
@@ -58,12 +63,14 @@ typedef struct {
   shift_component_id_t io_result;
   shift_component_id_t conn_entity;      /* sio_conn_entity_t */
   shift_component_id_t user_conn_entity; /* sio_user_conn_entity_t */
+  shift_component_id_t connect_addr;     /* sio_connect_addr_t */
 } sio_component_ids_t;
 
 typedef struct {
   shift_collection_id_t connections; /* user destroys entities here to close   */
   shift_collection_id_t read_in;     /* user moves consumed reads here         */
   shift_collection_id_t write_in;    /* user creates write entities here       */
+  shift_collection_id_t connect_in;  /* user creates connect entities here     */
 } sio_collection_ids_t;
 
 /* --------------------------------------------------------------------------
@@ -97,6 +104,12 @@ typedef struct {
    * sq_thread_cpu.  The struct is read/written (kernel fills output
    * fields).  NULL = default (flags 0). */
   struct io_uring_params *ring_params;
+  /* Outbound connection support (optional).
+   * Set enable_connect = true and provide connect_results to use the
+   * connect_in collection.  connect_results must carry at least:
+   *   {io_result, conn_entity, user_conn_entity}                       */
+  bool                  enable_connect;
+  shift_collection_id_t connect_results;
 } sio_config_t;
 
 /* --------------------------------------------------------------------------

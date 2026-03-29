@@ -4,7 +4,7 @@ A C23 TCP networking library built on [shift](https://github.com/anarchodev/shif
 
 ## Overview
 
-`shift-io` maps TCP connections to shift entities and drives them through collections as I/O events arrive. Application code never touches sockets or io_uring directly — it iterates SoA arrays from shift collections and moves entities between collections to drive the I/O lifecycle.
+`shift-io` maps TCP connections to shift entities and drives them through collections as I/O events arrive. It supports both inbound (accept) and outbound (connect) connections. Application code never touches sockets or io_uring directly — it iterates SoA arrays from shift collections and moves entities between collections to drive the I/O lifecycle.
 
 The user provides their own result collections for connections, reads, and writes. These collections must carry at least the required sio components but may include additional application-specific components. This lets the application attach custom state directly to I/O entities without external lookup tables.
 
@@ -45,6 +45,20 @@ sio_config_t cfg = {
 sio_context_create(&cfg, &ctx);
 ```
 
+To enable outbound connections, add a `connect_results` collection and set `enable_connect`:
+
+```c
+SHIFT_COLLECTION(sh, my_connect_results,
+                 comp_ids.io_result, comp_ids.conn_entity,
+                 comp_ids.user_conn_entity);
+
+sio_config_t cfg = {
+    /* ... base config as above ... */
+    .enable_connect  = true,
+    .connect_results = my_connect_results,
+};
+```
+
 This two-phase pattern generalizes to any library built on shift: register components first, let the user compose collections, then create the library context.
 
 ## Collections
@@ -55,9 +69,10 @@ The user creates these and passes them in `sio_config_t`. Each must contain at l
 
 | Collection | Required components | Purpose |
 |---|---|---|
-| `connection_results` | `conn_entity` | New connections appear here after accept. `conn_entity` links to the internal `connections` entity. Add custom components to track per-connection application state — component constructors fire on entity creation. |
+| `connection_results` | `conn_entity` | New connections appear here after accept or successful outbound connect. `conn_entity` links to the internal `connections` entity. Add custom components to track per-connection application state — component constructors fire on entity creation. |
 | `read_results` | `read_buf`, `io_result`, `conn_entity`, `user_conn_entity` | Read completions, EOF, and errors arrive here |
 | `write_results` | `write_buf`, `io_result`, `conn_entity`, `user_conn_entity` | Write completions and errors arrive here |
+| `connect_results` | `io_result`, `conn_entity`, `user_conn_entity` | Outbound connect outcomes (success or failure). Only required when `enable_connect` is true. |
 
 ### Library-owned collections
 
@@ -68,6 +83,7 @@ Returned via `sio_get_collection_ids()`.
 | `connections` | Internal connection tracking. **Only destroy entities here** — do not move entities out or modify components. Destroying an entity closes the connection. |
 | `read_in` | User moves consumed read entities here to re-arm recv. |
 | `write_in` | User creates write entities here to queue sends. |
+| `connect_in` | User creates connect entities here to initiate outbound connections. Only available when `enable_connect` is true. |
 
 ### Internal collections (not exposed)
 
@@ -76,6 +92,8 @@ Returned via `sio_get_collection_ids()`.
 | `read_pending` | Recv SQE armed, waiting for CQE |
 | `write_pending` | Send SQE submitted, waiting for CQE |
 | `write_retry` | Partial send, retried on next poll tick |
+| `connect_socket_pending` | Socket creation SQE submitted, waiting for fixed-file slot allocation |
+| `connect_pending` | Connect SQE submitted, waiting for CQE |
 
 ## Components
 
@@ -88,6 +106,7 @@ Registered by `sio_register_components()` and returned as `sio_component_ids_t`.
 | `io_result` | `sio_io_result_t` | Error code: 0 = success, negative = errno-style error |
 | `conn_entity` | `sio_conn_entity_t` | Handle to the internal `connections` entity for this connection |
 | `user_conn_entity` | `sio_user_conn_entity_t` | Handle to the user's `connection_results` entity |
+| `connect_addr` | `sio_connect_addr_t` | Target `struct sockaddr_in` for outbound connections |
 
 The `fd` component is internal to the library and not exposed. Users identify connections through entity handles (`conn_entity` and `user_conn_entity`), not file descriptors. These two components provide zero-lookup correlation: any read or write result entity carries handles to both the internal connection and the user's connection entity.
 
@@ -205,6 +224,54 @@ uce->entity = user_conn; /* from a read result's user_conn_entity */
 
 **Important**: `write_buf.data` must point to memory that remains valid until the entity appears in `write_results`. The user must always free `write_buf.data` and destroy the entity after it arrives in `write_results`, regardless of success or error.
 
+### Connect entity
+
+```
+user creates entity in connect_in
+  │   (set connect_addr.addr)
+  │
+  ├─► library submits socket creation, moves to connect_socket_pending
+  │
+  ├─► socket CQE: stores fd, submits connect + TCP_NODELAY
+  │     moves to connect_pending
+  │
+  ├─► connect CQE (success):
+  │     creates connection entities (connections, connection_results, read_pending)
+  │     sets io_result.error = 0, conn_entity, user_conn_entity
+  │     moves to connect_results
+  │     connection is now live — reads/writes work as normal
+  │
+  └─► connect CQE (failure):
+        sets io_result.error = negative errno
+        moves to connect_results
+```
+
+Connect entities are created by the user, one per outbound connection attempt. The library uses `io_uring_prep_socket_direct_alloc` to safely allocate a fixed-file slot (avoiding races with multishot accept's slot allocation).
+
+**Creating a connect entity:**
+
+```c
+shift_entity_t ce;
+shift_entity_create_one_begin(sh, coll_ids->connect_in, &ce);
+
+sio_connect_addr_t *ca = NULL;
+shift_entity_get_component(sh, ce, comp_ids.connect_addr, (void **)&ca);
+ca->addr = (struct sockaddr_in){
+    .sin_family      = AF_INET,
+    .sin_port        = htons(8080),
+    .sin_addr.s_addr = inet_addr("192.168.1.1"),
+};
+
+shift_entity_create_one_end(sh, ce);
+```
+
+**Processing connect results:**
+
+- `io_result.error == 0`: connection established. `conn_entity` and `user_conn_entity` point to the new connection. A `connection_results` entity was also created. Use `conn_entity` and `user_conn_entity` for writes and to correlate with reads.
+- `io_result.error < 0`: connect failed (negative errno, e.g. `-ECONNREFUSED`). No connection entities were created.
+
+Destroy the connect result entity after processing.
+
 ## Connection close
 
 There are two paths:
@@ -278,6 +345,8 @@ Creates the sio context. Validates that user-provided collections contain the re
 | `read_results` | User collection for read completions |
 | `write_results` | User collection for write completions |
 | `auto_destroy_user_entity` | Auto-destroy user connection entity on disconnect |
+| `enable_connect` | Enable outbound connection support (`connect_in` collection) |
+| `connect_results` | User collection for outbound connect outcomes (required when `enable_connect` is true) |
 
 ### `sio_context_destroy`
 
@@ -304,10 +373,11 @@ sio_result_t sio_poll(sio_context_t *ctx, uint32_t min_complete);
 Drives the I/O loop for one tick:
 1. Flush batched fixed-file slot releases
 2. Drain `read_in`: return buffers, move to `read_pending`, re-arm recv
-3. Arm sends from `write_retry` (partial) then `write_in` (new)
-4. `shift_flush` (collection membership current before submit)
-5. Submit SQEs, wait for `min_complete` CQEs, dispatch handlers
-6. `shift_flush` (application sees consistent view on return)
+3. Drain `connect_in`: submit socket creation SQEs, move to `connect_socket_pending`
+4. Arm sends from `write_retry` (partial) then `write_in` (new)
+5. `shift_flush` (collection membership current before submit)
+6. Submit SQEs, wait for `min_complete` CQEs, dispatch handlers
+7. `shift_flush` (application sees consistent view on return)
 
 ### `sio_get_component_ids` / `sio_get_collection_ids`
 
@@ -316,7 +386,7 @@ const sio_component_ids_t  *sio_get_component_ids(const sio_context_t *ctx);
 const sio_collection_ids_t *sio_get_collection_ids(const sio_context_t *ctx);
 ```
 
-Return pointers to the registered IDs. Component IDs are the same as those from `sio_register_components`. Collection IDs give access to `connections`, `read_in`, and `write_in`.
+Return pointers to the registered IDs. Component IDs are the same as those from `sio_register_components`. Collection IDs give access to `connections`, `read_in`, `write_in`, and `connect_in` (when `enable_connect` is true).
 
 ## Requirements
 
