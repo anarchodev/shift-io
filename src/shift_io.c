@@ -969,7 +969,7 @@ static void sio_drain_connect_in(sio_context_t *ctx) {
       break;
 
     io_uring_prep_socket_direct_alloc(
-        sqe, AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0, 0);
+        sqe, AF_INET, SOCK_STREAM, 0, 0);
     io_uring_sqe_set_data64(sqe, sio_encode_ud(entities[i]));
     shift_entity_move_one(ctx->shift, entities[i],
                           ctx->coll_connect_socket_pending);
