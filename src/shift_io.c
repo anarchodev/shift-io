@@ -158,6 +158,52 @@ static bool sio_collection_has_components(shift_t *sh,
 }
 
 /* --------------------------------------------------------------------------
+ * sio_superset_components (static)
+ * Builds a sorted, deduplicated component array that is the union of a
+ * user-provided collection's components and additional internal components.
+ * Caller must free() the returned array.  Returns NULL on failure.
+ * -------------------------------------------------------------------------- */
+
+static shift_component_id_t *
+sio_superset_components(shift_t *sh,
+                        shift_collection_id_t user_coll,
+                        const shift_component_id_t *extra,
+                        uint32_t extra_count,
+                        uint32_t *out_count) {
+  const shift_component_id_t *uc = NULL;
+  uint32_t                    un = 0;
+  if (shift_collection_get_components(sh, user_coll, &uc, &un) != shift_ok)
+    return NULL;
+
+  shift_component_id_t *buf = malloc((un + extra_count) * sizeof(*buf));
+  if (!buf)
+    return NULL;
+
+  /* Start with the user's sorted component list. */
+  memcpy(buf, uc, un * sizeof(*buf));
+  uint32_t n = un;
+
+  /* Insert each extra component in sorted order, skipping duplicates. */
+  for (uint32_t e = 0; e < extra_count; e++) {
+    shift_component_id_t id = extra[e];
+    bool dup = false;
+    uint32_t pos = n;
+    for (uint32_t i = 0; i < n; i++) {
+      if (buf[i] == id) { dup = true; break; }
+      if (buf[i] > id)  { pos = i;    break; }
+    }
+    if (dup)
+      continue;
+    memmove(buf + pos + 1, buf + pos, (n - pos) * sizeof(*buf));
+    buf[pos] = id;
+    n++;
+  }
+
+  *out_count = n;
+  return buf;
+}
+
+/* --------------------------------------------------------------------------
  * sio_register_components
  * Registers all sio component types on the given shift context.  Must be
  * called before creating user collections so the returned IDs can be used
@@ -326,19 +372,25 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
 
   err = sio_error_oom;
 
-  /* Register connections collection: {fd, user_conn_entity, read_cycle_entity} */
+  /* Register connections collection: superset of user's connection_results
+   * plus internal {fd, read_cycle_entity}. */
   {
-    shift_component_id_t conn_comps[] = {ctx->comp_fd,
-                                         ctx->comp_ids.user_conn_entity,
-                                         ctx->comp_read_cycle_entity};
+    shift_component_id_t extra[] = {ctx->comp_fd, ctx->comp_read_cycle_entity};
+    uint32_t count = 0;
+    shift_component_id_t *comps = sio_superset_components(
+        ctx->shift, cfg->connection_results, extra, 2, &count);
+    if (!comps)
+      goto cleanup_pending;
     shift_collection_info_t conn_info = {
         .name       = "connections",
-        .comp_ids   = conn_comps,
-        .comp_count = 3,
+        .comp_ids   = comps,
+        .comp_count = count,
         .max_capacity = 0,
     };
-    if (shift_collection_register(ctx->shift, &conn_info,
-                                  &ctx->coll_ids.connections) != shift_ok)
+    bool ok = shift_collection_register(ctx->shift, &conn_info,
+                                        &ctx->coll_ids.connections) == shift_ok;
+    free(comps);
+    if (!ok)
       goto cleanup_pending;
   }
 
@@ -351,75 +403,87 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
       goto cleanup_pending;
   }
 
-  /* Register read collections — all carry
-   * {fd, read_buf, io_result, conn_entity, user_conn_entity} */
-  shift_component_id_t read_comps[] = {
-      ctx->comp_fd, ctx->comp_ids.read_buf, ctx->comp_ids.io_result,
-      ctx->comp_ids.conn_entity, ctx->comp_ids.user_conn_entity};
-
+  /* Register read collections: superset of user's read_results
+   * plus internal {fd}.  Both read_pending and read_in share the same
+   * archetype so entities can move freely through the read pipeline. */
   {
+    shift_component_id_t extra[] = {ctx->comp_fd};
+    uint32_t count = 0;
+    shift_component_id_t *comps = sio_superset_components(
+        ctx->shift, cfg->read_results, extra, 1, &count);
+    if (!comps)
+      goto cleanup_pending;
+
     shift_collection_info_t read_pending_info = {
         .name       = "read_pending",
-        .comp_ids   = read_comps,
-        .comp_count = 5,
+        .comp_ids   = comps,
+        .comp_count = count,
         .max_capacity = 0,
     };
     if (shift_collection_register(ctx->shift, &read_pending_info,
-                                  &ctx->coll_read_pending) != shift_ok)
+                                  &ctx->coll_read_pending) != shift_ok) {
+      free(comps);
       goto cleanup_pending;
-  }
+    }
 
-  {
     shift_collection_info_t read_in_info = {
         .name       = "read_in",
-        .comp_ids   = read_comps,
-        .comp_count = 5,
+        .comp_ids   = comps,
+        .comp_count = count,
         .max_capacity = 0,
     };
-    if (shift_collection_register(ctx->shift, &read_in_info,
-                                  &ctx->coll_ids.read_in) != shift_ok)
+    bool ok = shift_collection_register(ctx->shift, &read_in_info,
+                                        &ctx->coll_ids.read_in) == shift_ok;
+    free(comps);
+    if (!ok)
       goto cleanup_pending;
   }
 
-  /* Register write collections — all carry
-   * {fd, write_buf, io_result, conn_entity, user_conn_entity} */
-  shift_component_id_t write_comps[] = {
-      ctx->comp_fd, ctx->comp_ids.write_buf, ctx->comp_ids.io_result,
-      ctx->comp_ids.conn_entity, ctx->comp_ids.user_conn_entity};
-
+  /* Register write collections: superset of user's write_results
+   * plus internal {fd}.  write_in, write_pending, and write_retry share
+   * the same archetype so entities move freely through the write pipeline. */
   {
+    shift_component_id_t extra[] = {ctx->comp_fd};
+    uint32_t count = 0;
+    shift_component_id_t *comps = sio_superset_components(
+        ctx->shift, cfg->write_results, extra, 1, &count);
+    if (!comps)
+      goto cleanup_pending;
+
     shift_collection_info_t write_in_info = {
         .name       = "write_in",
-        .comp_ids   = write_comps,
-        .comp_count = 5,
+        .comp_ids   = comps,
+        .comp_count = count,
         .max_capacity = 0,
     };
     if (shift_collection_register(ctx->shift, &write_in_info,
-                                  &ctx->coll_ids.write_in) != shift_ok)
+                                  &ctx->coll_ids.write_in) != shift_ok) {
+      free(comps);
       goto cleanup_pending;
-  }
+    }
 
-  {
     shift_collection_info_t write_pending_info = {
         .name       = "write_pending",
-        .comp_ids   = write_comps,
-        .comp_count = 5,
+        .comp_ids   = comps,
+        .comp_count = count,
         .max_capacity = 0,
     };
     if (shift_collection_register(ctx->shift, &write_pending_info,
-                                  &ctx->coll_write_pending) != shift_ok)
+                                  &ctx->coll_write_pending) != shift_ok) {
+      free(comps);
       goto cleanup_pending;
-  }
+    }
 
-  {
     shift_collection_info_t write_retry_info = {
         .name       = "write_retry",
-        .comp_ids   = write_comps,
-        .comp_count = 5,
+        .comp_ids   = comps,
+        .comp_count = count,
         .max_capacity = 0,
     };
-    if (shift_collection_register(ctx->shift, &write_retry_info,
-                                  &ctx->coll_write_retry) != shift_ok)
+    bool ok = shift_collection_register(ctx->shift, &write_retry_info,
+                                        &ctx->coll_write_retry) == shift_ok;
+    free(comps);
+    if (!ok)
       goto cleanup_pending;
   }
 
@@ -445,43 +509,48 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
 
     ctx->coll_connect_results = cfg->connect_results;
 
-    /* connect_in, connect_socket_pending, connect_pending all carry the same
-     * components so entities can move freely between them. */
-    shift_component_id_t connect_comps[] = {
-        ctx->comp_fd, ctx->comp_ids.connect_addr, ctx->comp_ids.io_result,
-        ctx->comp_ids.conn_entity, ctx->comp_ids.user_conn_entity};
-
+    /* connect_in, connect_socket_pending, connect_pending: superset of
+     * user's connect_results plus internal {fd, connect_addr}. */
     {
+      shift_component_id_t extra[] = {ctx->comp_fd, ctx->comp_ids.connect_addr};
+      uint32_t count = 0;
+      shift_component_id_t *comps = sio_superset_components(
+          ctx->shift, cfg->connect_results, extra, 2, &count);
+      if (!comps)
+        goto cleanup_pending;
+
       shift_collection_info_t ci_info = {
           .name       = "connect_in",
-          .comp_ids   = connect_comps,
-          .comp_count = 5,
+          .comp_ids   = comps,
+          .comp_count = count,
       };
       if (shift_collection_register(ctx->shift, &ci_info,
-                                    &ctx->coll_ids.connect_in) != shift_ok)
+                                    &ctx->coll_ids.connect_in) != shift_ok) {
+        free(comps);
         goto cleanup_pending;
-    }
+      }
 
-    {
       shift_collection_info_t csp_info = {
           .name       = "connect_socket_pending",
-          .comp_ids   = connect_comps,
-          .comp_count = 5,
+          .comp_ids   = comps,
+          .comp_count = count,
       };
       if (shift_collection_register(ctx->shift, &csp_info,
                                     &ctx->coll_connect_socket_pending) !=
-          shift_ok)
+          shift_ok) {
+        free(comps);
         goto cleanup_pending;
-    }
+      }
 
-    {
       shift_collection_info_t cp_info = {
           .name       = "connect_pending",
-          .comp_ids   = connect_comps,
-          .comp_count = 5,
+          .comp_ids   = comps,
+          .comp_count = count,
       };
-      if (shift_collection_register(ctx->shift, &cp_info,
-                                    &ctx->coll_connect_pending) != shift_ok)
+      bool ok = shift_collection_register(ctx->shift, &cp_info,
+                                          &ctx->coll_connect_pending) == shift_ok;
+      free(comps);
+      if (!ok)
         goto cleanup_pending;
     }
 
