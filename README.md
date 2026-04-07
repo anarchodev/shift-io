@@ -19,16 +19,28 @@ sio_register_components(sh, &comp_ids);
 
 /* Phase 2: create user-owned result collections using sio component IDs.
  * Extra components can be added for application state. */
-SHIFT_COLLECTION(sh, my_connection_results,
-                 comp_ids.conn_entity);
+shift_collection_id_t my_connection_results;
+{
+  shift_component_id_t    comps[] = {comp_ids.conn_entity};
+  shift_collection_info_t info    = {.name = "connection_results", .comp_ids = comps, .comp_count = 1};
+  shift_collection_register(sh, &info, &my_connection_results);
+}
 
-SHIFT_COLLECTION(sh, my_read_results,
-                 comp_ids.read_buf, comp_ids.io_result,
-                 comp_ids.conn_entity, comp_ids.user_conn_entity);
+shift_collection_id_t my_read_results;
+{
+  shift_component_id_t    comps[] = {comp_ids.read_buf, comp_ids.io_result,
+                                     comp_ids.conn_entity, comp_ids.user_conn_entity};
+  shift_collection_info_t info    = {.name = "read_results", .comp_ids = comps, .comp_count = 4};
+  shift_collection_register(sh, &info, &my_read_results);
+}
 
-SHIFT_COLLECTION(sh, my_write_results,
-                 comp_ids.write_buf, comp_ids.io_result,
-                 comp_ids.conn_entity, comp_ids.user_conn_entity);
+shift_collection_id_t my_write_results;
+{
+  shift_component_id_t    comps[] = {comp_ids.write_buf, comp_ids.io_result,
+                                     comp_ids.conn_entity, comp_ids.user_conn_entity};
+  shift_collection_info_t info    = {.name = "write_results", .comp_ids = comps, .comp_count = 4};
+  shift_collection_register(sh, &info, &my_write_results);
+}
 
 /* Phase 3: create sio context */
 sio_config_t cfg = {
@@ -48,9 +60,13 @@ sio_context_create(&cfg, &ctx);
 To enable outbound connections, add a `connect_results` collection and set `enable_connect`:
 
 ```c
-SHIFT_COLLECTION(sh, my_connect_results,
-                 comp_ids.io_result, comp_ids.conn_entity,
-                 comp_ids.user_conn_entity);
+shift_collection_id_t my_connect_results;
+{
+  shift_component_id_t    comps[] = {comp_ids.io_result, comp_ids.conn_entity,
+                                     comp_ids.user_conn_entity};
+  shift_collection_info_t info    = {.name = "connect_results", .comp_ids = comps, .comp_count = 3};
+  shift_collection_register(sh, &info, &my_connect_results);
+}
 
 sio_config_t cfg = {
     /* ... base config as above ... */
@@ -60,6 +76,12 @@ sio_config_t cfg = {
 ```
 
 This two-phase pattern generalizes to any library built on shift: register components first, let the user compose collections, then create the library context.
+
+### Component superset
+
+User-provided result collections may include extra application-specific components beyond the required sio components. The library's internal collections (`connections`, `read_in`, `write_in`, `read_pending`, `write_pending`, etc.) are automatically registered as supersets of the corresponding user collections. This means any custom components on the user's collections propagate to the internal collections, so entities can move freely through the I/O pipeline without losing application state.
+
+For example, if the user adds a `custom_tag` component to their `connection_results` collection, the internal `connections` collection will also carry `custom_tag` — component constructors and destructors fire as expected throughout the lifecycle.
 
 ## Collections
 
@@ -345,6 +367,7 @@ Creates the sio context. Validates that user-provided collections contain the re
 | `read_results` | User collection for read completions |
 | `write_results` | User collection for write completions |
 | `auto_destroy_user_entity` | Auto-destroy user connection entity on disconnect |
+| `ring_params` | Optional `struct io_uring_params *`. When non-NULL, the library uses `io_uring_queue_init_params()` instead of `io_uring_queue_init()`, allowing flags like `IORING_SETUP_SQPOLL` and `sq_thread_cpu`. NULL = default (flags 0). |
 | `enable_connect` | Enable outbound connection support (`connect_in` collection) |
 | `connect_results` | User collection for outbound connect outcomes (required when `enable_connect` is true) |
 
@@ -362,7 +385,7 @@ Tears down io_uring, frees buffers, closes the listen socket.
 sio_result_t sio_listen(sio_context_t *ctx, uint16_t port, int backlog);
 ```
 
-Opens a non-blocking TCP socket, binds to `INADDR_ANY:port`, and arms a multishot accept. Each accepted connection creates entities in `connection_results`, `connections`, and `read_pending`.
+Opens a non-blocking TCP socket, binds to `INADDR_ANY:port`, and arms a multishot accept. Each accepted connection creates entities in `connection_results`, `connections`, and `read_pending`. TCP_NODELAY is set on every accepted socket via an io_uring setsockopt SQE to disable Nagle's algorithm.
 
 ### `sio_poll`
 
@@ -412,7 +435,9 @@ cmake --build build --target echo_server
 echo "hello" | nc -w 1 localhost 7777   # terminal 2
 ```
 
-See `examples/echo_server.c` for the complete application loop demonstrating setup, read processing, write staging, and cleanup.
+See `examples/echo_server.c` for the complete application loop demonstrating setup, read processing, write staging, and cleanup (including `IORING_SETUP_SQPOLL` via `ring_params`).
+
+`examples/smoke_test.c` verifies that custom user components propagate through internal collections via the component superset feature.
 
 ## Known limitations
 

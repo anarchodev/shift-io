@@ -373,12 +373,14 @@ sio_result_t sio_context_create(const sio_config_t *cfg, sio_context_t **out) {
   err = sio_error_oom;
 
   /* Register connections collection: superset of user's connection_results
-   * plus internal {fd, read_cycle_entity}. */
+   * plus internal {fd, read_cycle_entity} and user_conn_entity (needed to
+   * store the back-reference to the user's connection_results entity). */
   {
-    shift_component_id_t extra[] = {ctx->comp_fd, ctx->comp_read_cycle_entity};
+    shift_component_id_t extra[] = {ctx->comp_fd, ctx->comp_read_cycle_entity,
+                                    ctx->comp_ids.user_conn_entity};
     uint32_t count = 0;
     shift_component_id_t *comps = sio_superset_components(
-        ctx->shift, cfg->connection_results, extra, 2, &count);
+        ctx->shift, cfg->connection_results, extra, 3, &count);
     if (!comps)
       goto cleanup_pending;
     shift_collection_info_t conn_info = {
