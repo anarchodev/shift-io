@@ -27,8 +27,9 @@ constexpr uint16_t SIO_BUF_GROUP_ID = 0;
  * RECV/SEND:   generation in bits[63:32] | index in bits[31:0]
  *
  * CQE dispatch uses the entity's collection membership (write_pending vs
- * read_pending) rather than a discriminator bit. sio_poll flushes all
- * deferred moves before submit_and_wait so col_id is always current.
+ * read_pending) rather than a discriminator bit. CQE handlers use
+ * _immediate moves so col_id is current for subsequent CQEs in the
+ * same batch.
  * -------------------------------------------------------------------------- */
 
 #define SIO_UD_ACCEPT   UINT64_MAX

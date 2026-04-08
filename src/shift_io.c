@@ -888,7 +888,7 @@ static sio_result_t sio_handle_accept_cqe(sio_context_t       *ctx,
   if (shift_entity_create_one_immediate(ctx->shift, ctx->coll_read_pending,
                                         &read_entity) != shift_ok) {
     sio_release_slot(ctx, new_slot);
-    shift_entity_destroy_one(ctx->shift, conn_entity);
+    shift_entity_destroy_one_immediate(ctx->shift, conn_entity);
     return rearm_result;
   }
 
@@ -958,7 +958,7 @@ static void sio_handle_connect_socket_cqe(sio_context_t       *ctx,
     shift_entity_get_component(ctx->shift, entity, ctx->comp_ids.io_result,
                                (void **)&ir);
     ir->error = slot;
-    shift_entity_move_one(ctx->shift, entity, ctx->coll_connect_errors);
+    shift_entity_move_one_immediate(ctx->shift, entity, ctx->coll_connect_errors);
     return;
   }
 
@@ -989,7 +989,7 @@ static void sio_handle_connect_socket_cqe(sio_context_t       *ctx,
     shift_entity_get_component(ctx->shift, entity, ctx->comp_ids.io_result,
                                (void **)&ir);
     ir->error = -EAGAIN;
-    shift_entity_move_one(ctx->shift, entity, ctx->coll_connect_errors);
+    shift_entity_move_one_immediate(ctx->shift, entity, ctx->coll_connect_errors);
     return;
   }
 
@@ -1001,7 +1001,7 @@ static void sio_handle_connect_socket_cqe(sio_context_t       *ctx,
                         sizeof(ca->addr));
   sqe->flags |= IOSQE_FIXED_FILE;
   io_uring_sqe_set_data64(sqe, sio_encode_ud(entity));
-  shift_entity_move_one(ctx->shift, entity, ctx->coll_connect_pending);
+  shift_entity_move_one_immediate(ctx->shift, entity, ctx->coll_connect_pending);
 }
 
 /* --------------------------------------------------------------------------
@@ -1033,7 +1033,7 @@ static void sio_handle_connect_cqe(sio_context_t       *ctx,
     sio_release_slot(ctx, slot);
     ent_fd->fd = -1; /* slot released; prevent fd_destructor double-release */
     ir->error = cqe->res;
-    shift_entity_move_one(ctx->shift, entity, ctx->coll_connect_errors);
+    shift_entity_move_one_immediate(ctx->shift, entity, ctx->coll_connect_errors);
     return;
   }
 
@@ -1047,7 +1047,7 @@ static void sio_handle_connect_cqe(sio_context_t       *ctx,
     sio_release_slot(ctx, slot);
     ent_fd->fd = -1;
     ir->error = -ENOMEM;
-    shift_entity_move_one(ctx->shift, entity, ctx->coll_connect_errors);
+    shift_entity_move_one_immediate(ctx->shift, entity, ctx->coll_connect_errors);
     return;
   }
 
@@ -1067,7 +1067,7 @@ static void sio_handle_connect_cqe(sio_context_t       *ctx,
   sio_arm_recv(ctx, slot, read_entity);
 
   /* Move the entity to connections — it IS the connection now */
-  shift_entity_move_one(ctx->shift, entity, ctx->coll_connections);
+  shift_entity_move_one_immediate(ctx->shift, entity, ctx->coll_connections);
 }
 
 /* --------------------------------------------------------------------------
@@ -1084,7 +1084,7 @@ static void sio_handle_recv_cqe(sio_context_t *ctx, struct io_uring_cqe *cqe) {
 
   if (res > 0) {
     if (!(cqe->flags & IORING_CQE_F_BUFFER)) {
-      shift_entity_destroy_one(ctx->shift, entity);
+      shift_entity_destroy_one_immediate(ctx->shift, entity);
       return;
     }
 
@@ -1097,7 +1097,7 @@ static void sio_handle_recv_cqe(sio_context_t *ctx, struct io_uring_cqe *cqe) {
       io_uring_buf_ring_add(ctx->buf_ring, data, ctx->buf_size, buf_id,
                             io_uring_buf_ring_mask(ctx->buf_count), 0);
       io_uring_buf_ring_advance(ctx->buf_ring, 1);
-      shift_entity_destroy_one(ctx->shift, entity);
+      shift_entity_destroy_one_immediate(ctx->shift, entity);
       return;
     }
     rb->data   = data;
@@ -1105,7 +1105,7 @@ static void sio_handle_recv_cqe(sio_context_t *ctx, struct io_uring_cqe *cqe) {
     rb->buf_id = buf_id;
 
     /* Move read-cycle entity to user's read_results */
-    shift_entity_move_one(ctx->shift, entity, ctx->coll_read_results);
+    shift_entity_move_one_immediate(ctx->shift, entity, ctx->coll_read_results);
 
   } else if (res == 0 || (res != -ENOBUFS && res != -EINTR && res != -EAGAIN)) {
     /* EOF or non-transient error — surface to user via read_results */
@@ -1114,9 +1114,9 @@ static void sio_handle_recv_cqe(sio_context_t *ctx, struct io_uring_cqe *cqe) {
                                (void **)&ir);
     if (ir) {
       ir->error = res;
-      shift_entity_move_one(ctx->shift, entity, ctx->coll_read_results);
+      shift_entity_move_one_immediate(ctx->shift, entity, ctx->coll_read_results);
     } else {
-      shift_entity_destroy_one(ctx->shift, entity);
+      shift_entity_destroy_one_immediate(ctx->shift, entity);
     }
   }
   /* -ENOBUFS/-EINTR/-EAGAIN: transient; entity stays in read_pending. */
@@ -1139,7 +1139,7 @@ static void sio_handle_send_cqe(sio_context_t *ctx, struct io_uring_cqe *cqe) {
   if (cqe->res < 0) {
     if (ir)
       ir->error = cqe->res;
-    shift_entity_move_one(ctx->shift, entity, ctx->coll_write_results);
+    shift_entity_move_one_immediate(ctx->shift, entity, ctx->coll_write_results);
     return;
   }
 
@@ -1148,18 +1148,18 @@ static void sio_handle_send_cqe(sio_context_t *ctx, struct io_uring_cqe *cqe) {
                                  (void **)&wb) != shift_ok) {
     if (ir)
       ir->error = -EIO;
-    shift_entity_move_one(ctx->shift, entity, ctx->coll_write_results);
+    shift_entity_move_one_immediate(ctx->shift, entity, ctx->coll_write_results);
     return;
   }
 
   wb->offset += (uint32_t)cqe->res;
   if (wb->offset < wb->len) {
-    shift_entity_move_one(ctx->shift, entity, ctx->coll_write_retry);
+    shift_entity_move_one_immediate(ctx->shift, entity, ctx->coll_write_retry);
     return;
   }
 
   /* Full send complete */
-  shift_entity_move_one(ctx->shift, entity, ctx->coll_write_results);
+  shift_entity_move_one_immediate(ctx->shift, entity, ctx->coll_write_results);
 }
 
 /* --------------------------------------------------------------------------
@@ -1234,14 +1234,13 @@ sio_result_t sio_poll(sio_context_t *ctx, uint32_t min_complete) {
   if (sio_arm_sends(ctx, ctx->coll_write_retry))
     sio_arm_sends(ctx, ctx->coll_ids.write_in);
 
-  /* Step 4: commit all deferred moves so col_id is current before waiting. */
+  /* Step 4: commit deferred moves from arming so col_id is current. */
   shift_flush(ctx->shift);
 
-  /* Steps 5-7: submit SQEs, wait for CQEs, dispatch handlers, advance CQ. */
+  /* Steps 5-7: submit SQEs, wait for CQEs, dispatch handlers, advance CQ.
+   * CQE handlers use _immediate moves so col_id stays current across a
+   * batch — no post-drain flush needed. */
   sio_result_t poll_result = sio_submit_and_drain(ctx, min_complete);
-
-  /* Step 8: commit deferred entity moves queued during CQE processing. */
-  shift_flush(ctx->shift);
 
   return poll_result;
 }
