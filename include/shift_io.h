@@ -42,12 +42,18 @@ typedef struct {
 } sio_write_buf_t;
 
 typedef struct {
-  shift_entity_t entity; /* handle to internal connections entity */
+  shift_entity_t entity; /* handle to connections entity */
 } sio_conn_entity_t;
 
 typedef struct {
-  shift_entity_t entity; /* handle to user's connection_results entity */
-} sio_user_conn_entity_t;
+  int fd; /* fixed-file slot index */
+} sio_fd_t;
+
+/* Stored on connection entities to track the associated read-cycle entity
+ * for cleanup when the connection is destroyed. */
+typedef struct {
+  shift_entity_t entity;
+} sio_read_cycle_entity_t;
 
 typedef struct {
   struct sockaddr_in addr; /* target address for outbound connection */
@@ -62,12 +68,12 @@ typedef struct {
   shift_component_id_t write_buf;
   shift_component_id_t io_result;
   shift_component_id_t conn_entity;      /* sio_conn_entity_t */
-  shift_component_id_t user_conn_entity; /* sio_user_conn_entity_t */
+  shift_component_id_t fd;               /* sio_fd_t */
+  shift_component_id_t read_cycle_entity;/* sio_read_cycle_entity_t */
   shift_component_id_t connect_addr;     /* sio_connect_addr_t */
 } sio_component_ids_t;
 
 typedef struct {
-  shift_collection_id_t connections; /* user destroys entities here to close   */
   shift_collection_id_t read_in;     /* user moves consumed reads here         */
   shift_collection_id_t write_in;    /* user creates write entities here       */
   shift_collection_id_t connect_in;  /* user creates connect entities here     */
@@ -85,19 +91,14 @@ typedef struct {
   uint32_t buf_size;        /* size of each pinned receive buffer in bytes */
   uint32_t max_connections; /* maximum number of concurrent connections */
   uint32_t ring_entries;    /* io_uring queue depth */
-  /* User-provided result collections.  Each must carry at least the required
+  /* User-provided collections.  Each must carry at least the required
    * sio components (validated at context creation via introspection).
-   *   connection_results: >= {conn_entity}
-   *   read_results:       >= {read_buf, io_result,
-   *                            conn_entity, user_conn_entity}
-   *   write_results:      >= {write_buf, io_result,
-   *                            conn_entity, user_conn_entity}           */
-  shift_collection_id_t connection_results;
+   *   connections:   >= {fd, read_cycle_entity}
+   *   read_results:  >= {read_buf, io_result, conn_entity}
+   *   write_results: >= {write_buf, io_result, conn_entity}             */
+  shift_collection_id_t connections;
   shift_collection_id_t read_results;
   shift_collection_id_t write_results;
-  /* When true, the library destroys the user's connection_results entity
-   * automatically when the connection disconnects (EOF or error). */
-  bool auto_destroy_user_entity;
   /* Optional io_uring params.  When non-NULL the library uses
    * io_uring_queue_init_params() instead of io_uring_queue_init(),
    * allowing the caller to set flags like IORING_SETUP_SQPOLL and
@@ -105,11 +106,12 @@ typedef struct {
    * fields).  NULL = default (flags 0). */
   struct io_uring_params *ring_params;
   /* Outbound connection support (optional).
-   * Set enable_connect = true and provide connect_results to use the
-   * connect_in collection.  connect_results must carry at least:
-   *   {io_result, conn_entity, user_conn_entity}                       */
+   * Set enable_connect = true and provide connect_errors to use the
+   * connect_in collection.  Successful connects move to connections.
+   * Failed connects move to connect_errors.
+   *   connect_errors: >= {io_result, connect_addr}                      */
   bool                  enable_connect;
-  shift_collection_id_t connect_results;
+  shift_collection_id_t connect_errors;
 } sio_config_t;
 
 /* --------------------------------------------------------------------------

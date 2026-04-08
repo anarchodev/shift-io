@@ -58,32 +58,31 @@ int main(void) {
     }
   }
 
-  /* Create user result collections WITH the custom component */
-  shift_collection_id_t connection_results_coll;
+  /* Create user collections WITH the custom component */
+  shift_collection_id_t connections_coll;
   {
-    shift_component_id_t comps[] = {comp_ids.conn_entity, custom_comp};
+    shift_component_id_t comps[] = {comp_ids.fd, comp_ids.read_cycle_entity,
+                                    custom_comp};
     shift_collection_info_t info = {
-        .name = "connection_results", .comp_ids = comps, .comp_count = 2};
-    shift_collection_register(sh, &info, &connection_results_coll);
+        .name = "connections", .comp_ids = comps, .comp_count = 3};
+    shift_collection_register(sh, &info, &connections_coll);
   }
 
   shift_collection_id_t read_results_coll;
   {
     shift_component_id_t comps[] = {comp_ids.read_buf, comp_ids.io_result,
-                                    comp_ids.conn_entity,
-                                    comp_ids.user_conn_entity, custom_comp};
+                                    comp_ids.conn_entity, custom_comp};
     shift_collection_info_t info = {
-        .name = "read_results", .comp_ids = comps, .comp_count = 5};
+        .name = "read_results", .comp_ids = comps, .comp_count = 4};
     shift_collection_register(sh, &info, &read_results_coll);
   }
 
   shift_collection_id_t write_results_coll;
   {
     shift_component_id_t comps[] = {comp_ids.write_buf, comp_ids.io_result,
-                                    comp_ids.conn_entity,
-                                    comp_ids.user_conn_entity, custom_comp};
+                                    comp_ids.conn_entity, custom_comp};
     shift_collection_info_t info = {
-        .name = "write_results", .comp_ids = comps, .comp_count = 5};
+        .name = "write_results", .comp_ids = comps, .comp_count = 4};
     shift_collection_register(sh, &info, &write_results_coll);
   }
 
@@ -96,10 +95,9 @@ int main(void) {
       .buf_size           = BUF_SIZE,
       .max_connections    = MAX_CONNECTIONS,
       .ring_entries       = 64,
-      .connection_results = connection_results_coll,
-      .read_results       = read_results_coll,
-      .write_results      = write_results_coll,
-      .auto_destroy_user_entity = false,
+      .connections         = connections_coll,
+      .read_results        = read_results_coll,
+      .write_results       = write_results_coll,
   };
   if (sio_context_create(&sio_cfg, &ctx) != sio_ok) {
     fprintf(stderr, "FAIL: sio_context_create\n");
@@ -121,7 +119,7 @@ int main(void) {
     }                                                                         \
   } while (0)
 
-  CHECK("connections",  coll_ids->connections);
+  CHECK("connections",  connections_coll);
   CHECK("read_in",      coll_ids->read_in);
   CHECK("write_in",     coll_ids->write_in);
 

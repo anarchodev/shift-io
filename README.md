@@ -6,7 +6,7 @@ A C23 TCP networking library built on [shift](https://github.com/anarchodev/shif
 
 `shift-io` maps TCP connections to shift entities and drives them through collections as I/O events arrive. It supports both inbound (accept) and outbound (connect) connections. Application code never touches sockets or io_uring directly — it iterates SoA arrays from shift collections and moves entities between collections to drive the I/O lifecycle.
 
-The user provides their own result collections for connections, reads, and writes. These collections must carry at least the required sio components but may include additional application-specific components. This lets the application attach custom state directly to I/O entities without external lookup tables.
+The user provides their own collections for connections, reads, writes, and connect errors. These collections must carry at least the required sio components but may include additional application-specific components. This lets the application attach custom state directly to I/O entities without external lookup tables.
 
 ## Setup
 
@@ -17,28 +17,28 @@ Construction is two-phase so that component IDs are available before collections
 sio_component_ids_t comp_ids;
 sio_register_components(sh, &comp_ids);
 
-/* Phase 2: create user-owned result collections using sio component IDs.
+/* Phase 2: create user-owned collections using sio component IDs.
  * Extra components can be added for application state. */
-shift_collection_id_t my_connection_results;
+shift_collection_id_t my_connections;
 {
-  shift_component_id_t    comps[] = {comp_ids.conn_entity};
-  shift_collection_info_t info    = {.name = "connection_results", .comp_ids = comps, .comp_count = 1};
-  shift_collection_register(sh, &info, &my_connection_results);
+  shift_component_id_t    comps[] = {comp_ids.fd, comp_ids.read_cycle_entity};
+  shift_collection_info_t info    = {.name = "connections", .comp_ids = comps, .comp_count = 2};
+  shift_collection_register(sh, &info, &my_connections);
 }
 
 shift_collection_id_t my_read_results;
 {
   shift_component_id_t    comps[] = {comp_ids.read_buf, comp_ids.io_result,
-                                     comp_ids.conn_entity, comp_ids.user_conn_entity};
-  shift_collection_info_t info    = {.name = "read_results", .comp_ids = comps, .comp_count = 4};
+                                     comp_ids.conn_entity};
+  shift_collection_info_t info    = {.name = "read_results", .comp_ids = comps, .comp_count = 3};
   shift_collection_register(sh, &info, &my_read_results);
 }
 
 shift_collection_id_t my_write_results;
 {
   shift_component_id_t    comps[] = {comp_ids.write_buf, comp_ids.io_result,
-                                     comp_ids.conn_entity, comp_ids.user_conn_entity};
-  shift_collection_info_t info    = {.name = "write_results", .comp_ids = comps, .comp_count = 4};
+                                     comp_ids.conn_entity};
+  shift_collection_info_t info    = {.name = "write_results", .comp_ids = comps, .comp_count = 3};
   shift_collection_register(sh, &info, &my_write_results);
 }
 
@@ -50,72 +50,72 @@ sio_config_t cfg = {
     .buf_size           = 4096,
     .max_connections    = 4096,
     .ring_entries       = 256,
-    .connection_results = my_connection_results,
-    .read_results       = my_read_results,
-    .write_results      = my_write_results,
+    .connections         = my_connections,
+    .read_results        = my_read_results,
+    .write_results       = my_write_results,
 };
 sio_context_create(&cfg, &ctx);
 ```
 
-To enable outbound connections, add a `connect_results` collection and set `enable_connect`:
+To enable outbound connections, add a `connect_errors` collection and set `enable_connect`:
 
 ```c
-shift_collection_id_t my_connect_results;
+shift_collection_id_t my_connect_errors;
 {
-  shift_component_id_t    comps[] = {comp_ids.io_result, comp_ids.conn_entity,
-                                     comp_ids.user_conn_entity};
-  shift_collection_info_t info    = {.name = "connect_results", .comp_ids = comps, .comp_count = 3};
-  shift_collection_register(sh, &info, &my_connect_results);
+  shift_component_id_t    comps[] = {comp_ids.io_result, comp_ids.connect_addr};
+  shift_collection_info_t info    = {.name = "connect_errors", .comp_ids = comps, .comp_count = 2};
+  shift_collection_register(sh, &info, &my_connect_errors);
 }
 
 sio_config_t cfg = {
     /* ... base config as above ... */
     .enable_connect  = true,
-    .connect_results = my_connect_results,
+    .connect_errors  = my_connect_errors,
 };
 ```
+
+Successful outbound connects appear in the `connections` collection (same as accepted connections). Failed connects appear in `connect_errors`.
 
 This two-phase pattern generalizes to any library built on shift: register components first, let the user compose collections, then create the library context.
 
 ### Component superset
 
-User-provided result collections may include extra application-specific components beyond the required sio components. The library's internal collections (`connections`, `read_in`, `write_in`, `read_pending`, `write_pending`, etc.) are automatically registered as supersets of the corresponding user collections. This means any custom components on the user's collections propagate to the internal collections, so entities can move freely through the I/O pipeline without losing application state.
+User-provided collections may include extra application-specific components beyond the required sio components. The library's internal collections (`read_in`, `write_in`, `read_pending`, `write_pending`, etc.) are automatically registered with the same archetype as the corresponding user collection (or as supersets when internal components are needed). This means any custom components on the user's collections propagate to the internal collections, so entities can move freely through the I/O pipeline without losing application state.
 
-For example, if the user adds a `custom_tag` component to their `connection_results` collection, the internal `connections` collection will also carry `custom_tag` — component constructors and destructors fire as expected throughout the lifecycle.
+For example, if the user adds a `custom_tag` component to their `connections` collection, and an entity is accepted into `connections`, it will carry `custom_tag` with its constructor fired as expected.
 
 ## Collections
 
-### User-provided result collections
+### User-provided collections
 
 The user creates these and passes them in `sio_config_t`. Each must contain at least the listed components (extra components are allowed and preserved across entity moves).
 
 | Collection | Required components | Purpose |
 |---|---|---|
-| `connection_results` | `conn_entity` | New connections appear here after accept or successful outbound connect. `conn_entity` links to the internal `connections` entity. Add custom components to track per-connection application state — component constructors fire on entity creation. |
-| `read_results` | `read_buf`, `io_result`, `conn_entity`, `user_conn_entity` | Read completions, EOF, and errors arrive here |
-| `write_results` | `write_buf`, `io_result`, `conn_entity`, `user_conn_entity` | Write completions and errors arrive here |
-| `connect_results` | `io_result`, `conn_entity`, `user_conn_entity` | Outbound connect outcomes (success or failure). Only required when `enable_connect` is true. |
+| `connections` | `fd`, `read_cycle_entity` | Live connections. New connections appear here on accept or successful outbound connect. User destroys entities here to close connections. |
+| `read_results` | `read_buf`, `io_result`, `conn_entity` | Read completions, EOF, and errors arrive here |
+| `write_results` | `write_buf`, `io_result`, `conn_entity` | Write completions and errors arrive here |
+| `connect_errors` | `io_result`, `connect_addr` | Failed outbound connect attempts. Only required when `enable_connect` is true. |
 
-### Library-owned collections
+### Library-created collections (exposed)
 
 Returned via `sio_get_collection_ids()`.
 
-| Collection | Purpose |
-|---|---|
-| `connections` | Internal connection tracking. **Only destroy entities here** — do not move entities out or modify components. Destroying an entity closes the connection. |
-| `read_in` | User moves consumed read entities here to re-arm recv. |
-| `write_in` | User creates write entities here to queue sends. |
-| `connect_in` | User creates connect entities here to initiate outbound connections. Only available when `enable_connect` is true. |
+| Collection | Archetype | Purpose |
+|---|---|---|
+| `read_in` | same as `read_results` | User moves consumed read entities here to re-arm recv |
+| `write_in` | same as `write_results` | User creates write entities here to queue sends |
+| `connect_in` | superset of `connections` + `{connect_addr, io_result}` | User creates connect entities here to initiate outbound connections. Only available when `enable_connect` is true. |
 
 ### Internal collections (not exposed)
 
-| Collection | Purpose |
-|---|---|
-| `read_pending` | Recv SQE armed, waiting for CQE |
-| `write_pending` | Send SQE submitted, waiting for CQE |
-| `write_retry` | Partial send, retried on next poll tick |
-| `connect_socket_pending` | Socket creation SQE submitted, waiting for fixed-file slot allocation |
-| `connect_pending` | Connect SQE submitted, waiting for CQE |
+| Collection | Archetype | Purpose |
+|---|---|---|
+| `read_pending` | same as `read_results` | Recv SQE armed, waiting for CQE |
+| `write_pending` | same as `write_results` | Send SQE submitted, waiting for CQE |
+| `write_retry` | same as `write_results` | Partial send, retried on next poll tick |
+| `connect_socket_pending` | same as `connect_in` | Socket creation SQE submitted, waiting for fixed-file slot allocation |
+| `connect_pending` | same as `connect_in` | Connect SQE submitted, waiting for CQE |
 
 ## Components
 
@@ -126,66 +126,49 @@ Registered by `sio_register_components()` and returned as `sio_component_ids_t`.
 | `read_buf` | `sio_read_buf_t` | Pointer, length, and buffer ID for received data |
 | `write_buf` | `sio_write_buf_t` | Pointer, total length, and bytes-sent offset for outgoing data |
 | `io_result` | `sio_io_result_t` | Error code: 0 = success, negative = errno-style error |
-| `conn_entity` | `sio_conn_entity_t` | Handle to the internal `connections` entity for this connection |
-| `user_conn_entity` | `sio_user_conn_entity_t` | Handle to the user's `connection_results` entity |
+| `conn_entity` | `sio_conn_entity_t` | Handle to the connection entity. Carried by read/write entities for correlation. |
+| `fd` | `sio_fd_t` | Fixed-file slot index. Carried by connection entities. Has a destructor that releases the slot. |
+| `read_cycle_entity` | `sio_read_cycle_entity_t` | Handle to the read-cycle entity. Carried by connection entities. Has a destructor that cleans up the read entity. |
 | `connect_addr` | `sio_connect_addr_t` | Target `struct sockaddr_in` for outbound connections |
 
-The `fd` component is internal to the library and not exposed. Users identify connections through entity handles (`conn_entity` and `user_conn_entity`), not file descriptors. These two components provide zero-lookup correlation: any read or write result entity carries handles to both the internal connection and the user's connection entity.
+Users identify connections through entity handles (`conn_entity` on read/write entities). The `fd` and `read_cycle_entity` components are required on connection collections but are managed by the library — users include them in the archetype but do not set them directly.
 
 ## Entity lifetimes
 
-### Connection entity (user's `connection_results`)
+### Connection entity
 
 ```
-accept
-  └─► entity created in connection_results (2-phase: begin → end)
-      │
-      ├─ lives until disconnect or user-initiated close
-      │
-      └─► destroyed by:
-            • the user (after seeing EOF/error in read_results)
-            • the library (if auto_destroy_user_entity is true)
+accept or successful outbound connect
+  └--> entity created in connections
+      |
+      +-- lives until disconnect or user-initiated close
+      |
+      └--> destroyed by the user
+             read_cycle_entity destructor fires: destroys the read-cycle entity
+             fd destructor fires: releases fixed-file slot
 ```
 
-Created on accept via two-phase creation. The `conn_entity` component is set by the library, linking this entity to the internal `connections` entity. The user can attach application state via custom components on the collection — component constructors fire during creation, making this the natural place for per-connection initialization. No fd is exposed; connections are identified by entity handle. This entity is long-lived and persists for the entire connection lifetime. The user is responsible for destroying it after the connection ends (unless `auto_destroy_user_entity` is set).
-
-### Internal connection entity (`connections`)
-
-```
-accept
-  └─► entity created in connections (immediate)
-      │
-      ├─ carries: fd, user_conn_entity, read_cycle_entity (internal)
-      │
-      └─► destroyed by:
-            • the user (to initiate close)
-            • on_leave callback fires:
-                • destroys the read-cycle entity
-                • optionally destroys user's connection entity
-            • fd destructor fires: releases fixed-file slot
-```
-
-Created on accept alongside the user connection entity. The user destroys this entity to close a connection. The `on_leave` callback handles cascading cleanup.
+On accept, the library creates the entity directly in the user's `connections` collection. On successful outbound connect, the connect entity moves to `connections` — it becomes the connection (same entity, same identity). The `fd` and `read_cycle_entity` components are set by the library. The user can attach application state via custom components on the collection.
 
 ### Read-cycle entity
 
 ```
-accept
-  └─► entity created in read_pending (immediate)
-      │
-      ├─► recv CQE arrives (data):
-      │     move to read_results ──► user consumes data
-      │                               move to read_in ──► library moves to read_pending
-      │                                                    re-arms recv ──► …
-      │
-      ├─► recv CQE arrives (EOF / error):
-      │     move to read_results ──► user sees error, destroys entity
-      │
-      └─► connection closed (connections entity destroyed):
-            on_leave destroys this entity if still alive
+accept or connect success
+  └--> entity created in read_pending
+      |
+      +-- recv CQE arrives (data):
+      |     move to read_results --> user consumes data
+      |                               move to read_in --> library moves to read_pending
+      |                                                    re-arms recv --> ...
+      |
+      +-- recv CQE arrives (EOF / error):
+      |     move to read_results --> user sees error, destroys entity
+      |
+      └-- connection closed (connection entity destroyed):
+            read_cycle_entity destructor destroys this entity if still alive
 ```
 
-One read-cycle entity exists per connection. It cycles between `read_pending` (internal), the user's `read_results`, and `read_in` (library-owned). It carries `conn_entity` and `user_conn_entity` for correlation.
+One read-cycle entity exists per connection. It cycles between `read_pending` (internal), the user's `read_results`, and `read_in` (library-created). It carries `conn_entity` for correlation back to the connection.
 
 **Consuming a read result:**
 
@@ -202,22 +185,22 @@ Failing to move the entity to `read_in` stalls reads on that connection.
 - `io_result.error == 0` and `read_buf.len == 0`: EOF (remote closed gracefully)
 - `io_result.error < 0`: error (negative errno, e.g. `-ECONNRESET`)
 
-On EOF or error, destroy the read-cycle entity and the `connections` entity (via `conn_entity`).
+On EOF or error, destroy the read-cycle entity and the connection entity (via `conn_entity`).
 
 ### Write entity
 
 ```
 user creates entity in write_in
-  │   (set write_buf.data, write_buf.len, conn_entity, user_conn_entity)
-  │
-  ├─► library arms send, moves to write_pending
-  │
-  ├─► send CQE (partial): move to write_retry, retry next tick
-  │
-  ├─► send CQE (complete): move to write_results
-  │     user frees write_buf.data, destroys entity
-  │
-  └─► send CQE (error): move to write_results with io_result.error set
+  |   (set write_buf.data, write_buf.len, conn_entity)
+  |
+  +-- library arms send, moves to write_pending
+  |
+  +-- send CQE (partial): move to write_retry, retry next tick
+  |
+  +-- send CQE (complete): move to write_results
+  |     user frees write_buf.data, destroys entity
+  |
+  └-- send CQE (error): move to write_results with io_result.error set
         user frees write_buf.data, destroys entity
 ```
 
@@ -237,11 +220,7 @@ wb->offset = 0;         /* must be initialized to 0 */
 
 sio_conn_entity_t *ce = NULL;
 shift_entity_get_component(sh, wr, comp_ids.conn_entity, (void **)&ce);
-ce->entity = conn;      /* from a read result's conn_entity */
-
-sio_user_conn_entity_t *uce = NULL;
-shift_entity_get_component(sh, wr, comp_ids.user_conn_entity, (void **)&uce);
-uce->entity = user_conn; /* from a read result's user_conn_entity */
+ce->entity = conn;      /* from a read result's conn_entity, or the connection entity directly */
 ```
 
 **Important**: `write_buf.data` must point to memory that remains valid until the entity appears in `write_results`. The user must always free `write_buf.data` and destroy the entity after it arrives in `write_results`, regardless of success or error.
@@ -250,25 +229,23 @@ uce->entity = user_conn; /* from a read result's user_conn_entity */
 
 ```
 user creates entity in connect_in
-  │   (set connect_addr.addr)
-  │
-  ├─► library submits socket creation, moves to connect_socket_pending
-  │
-  ├─► socket CQE: stores fd, submits connect + TCP_NODELAY
-  │     moves to connect_pending
-  │
-  ├─► connect CQE (success):
-  │     creates connection entities (connections, connection_results, read_pending)
-  │     sets io_result.error = 0, conn_entity, user_conn_entity
-  │     moves to connect_results
-  │     connection is now live — reads/writes work as normal
-  │
-  └─► connect CQE (failure):
+  |   (set connect_addr.addr)
+  |
+  +-- library submits socket creation, moves to connect_socket_pending
+  |
+  +-- socket CQE: stores fd, submits connect + TCP_NODELAY
+  |     moves to connect_pending
+  |
+  +-- connect CQE (success):
+  |     creates read-cycle entity, arms recv
+  |     moves entity to connections — it IS the connection now
+  |
+  └-- connect CQE (failure):
         sets io_result.error = negative errno
-        moves to connect_results
+        moves to connect_errors
 ```
 
-Connect entities are created by the user, one per outbound connection attempt. The library uses `io_uring_prep_socket_direct_alloc` to safely allocate a fixed-file slot (avoiding races with multishot accept's slot allocation).
+Connect entities are created by the user, one per outbound connection attempt. On success, the entity moves directly to `connections` — no separate connection entity is created. The same entity that started in `connect_in` becomes the live connection.
 
 **Creating a connect entity:**
 
@@ -289,10 +266,10 @@ shift_entity_create_one_end(sh, ce);
 
 **Processing connect results:**
 
-- `io_result.error == 0`: connection established. `conn_entity` and `user_conn_entity` point to the new connection. A `connection_results` entity was also created. Use `conn_entity` and `user_conn_entity` for writes and to correlate with reads.
-- `io_result.error < 0`: connect failed (negative errno, e.g. `-ECONNREFUSED`). No connection entities were created.
+- Successful connects appear in `connections`. The entity that was in `connect_in` is now the connection entity. Custom components set before the connect are preserved.
+- Failed connects appear in `connect_errors` with `io_result.error < 0` (negative errno, e.g. `-ECONNREFUSED`). The `connect_addr` component is preserved for error reporting or retry.
 
-Destroy the connect result entity after processing.
+Destroy failed connect entities from `connect_errors` after processing.
 
 ## Connection close
 
@@ -301,16 +278,13 @@ There are two paths:
 **Remote disconnect** (EOF or error on recv):
 1. Read-cycle entity moves to `read_results` with EOF (`io_result.error == 0`, `read_buf.len == 0`) or error (`io_result.error < 0`)
 2. User destroys the read-cycle entity
-3. User destroys the `connections` entity (via `conn_entity`) to release the fixed-file slot
-4. User destroys the `connection_results` entity (via `user_conn_entity`) to clean up application state — or omit this step if `auto_destroy_user_entity` is set
+3. User destroys the connection entity to release the fixed-file slot
 
 **User-initiated close**:
-1. User destroys the `connections` entity
-2. `on_leave` callback destroys the read-cycle entity (returns any held buffer)
+1. User destroys the connection entity
+2. `read_cycle_entity` destructor destroys the read-cycle entity (returns any held buffer)
 3. `fd` destructor releases the fixed-file slot
 4. Any in-flight recv/send CQEs are filtered by staleness checks
-
-If `auto_destroy_user_entity` is set in the config, the library automatically destroys the user's `connection_results` entity when the `connections` entity is destroyed.
 
 ## Flush timing
 
@@ -363,13 +337,12 @@ Creates the sio context. Validates that user-provided collections contain the re
 | `buf_size` | Size of each receive buffer in bytes |
 | `max_connections` | Maximum concurrent connections (fixed-file pool size) |
 | `ring_entries` | io_uring queue depth |
-| `connection_results` | User collection for new connections |
-| `read_results` | User collection for read completions |
-| `write_results` | User collection for write completions |
-| `auto_destroy_user_entity` | Auto-destroy user connection entity on disconnect |
+| `connections` | User collection for live connections (required: `fd`, `read_cycle_entity`) |
+| `read_results` | User collection for read completions (required: `read_buf`, `io_result`, `conn_entity`) |
+| `write_results` | User collection for write completions (required: `write_buf`, `io_result`, `conn_entity`) |
 | `ring_params` | Optional `struct io_uring_params *`. When non-NULL, the library uses `io_uring_queue_init_params()` instead of `io_uring_queue_init()`, allowing flags like `IORING_SETUP_SQPOLL` and `sq_thread_cpu`. NULL = default (flags 0). |
 | `enable_connect` | Enable outbound connection support (`connect_in` collection) |
-| `connect_results` | User collection for outbound connect outcomes (required when `enable_connect` is true) |
+| `connect_errors` | User collection for failed outbound connects (required: `io_result`, `connect_addr`). Only required when `enable_connect` is true. Successful connects appear in `connections`. |
 
 ### `sio_context_destroy`
 
@@ -385,7 +358,7 @@ Tears down io_uring, frees buffers, closes the listen socket.
 sio_result_t sio_listen(sio_context_t *ctx, uint16_t port, int backlog);
 ```
 
-Opens a non-blocking TCP socket, binds to `INADDR_ANY:port`, and arms a multishot accept. Each accepted connection creates entities in `connection_results`, `connections`, and `read_pending`. TCP_NODELAY is set on every accepted socket via an io_uring setsockopt SQE to disable Nagle's algorithm.
+Opens a non-blocking TCP socket, binds to `INADDR_ANY:port`, and arms a multishot accept. Each accepted connection creates an entity in `connections` and a read-cycle entity in `read_pending`. TCP_NODELAY is set on every accepted socket via an io_uring setsockopt SQE to disable Nagle's algorithm.
 
 ### `sio_poll`
 
@@ -409,7 +382,7 @@ const sio_component_ids_t  *sio_get_component_ids(const sio_context_t *ctx);
 const sio_collection_ids_t *sio_get_collection_ids(const sio_context_t *ctx);
 ```
 
-Return pointers to the registered IDs. Component IDs are the same as those from `sio_register_components`. Collection IDs give access to `connections`, `read_in`, `write_in`, and `connect_in` (when `enable_connect` is true).
+Return pointers to the registered IDs. Component IDs are the same as those from `sio_register_components`. Collection IDs give access to `read_in`, `write_in`, and `connect_in` (when `enable_connect` is true).
 
 ## Requirements
 
@@ -437,13 +410,12 @@ echo "hello" | nc -w 1 localhost 7777   # terminal 2
 
 See `examples/echo_server.c` for the complete application loop demonstrating setup, read processing, write staging, and cleanup (including `IORING_SETUP_SQPOLL` via `ring_params`).
 
-`examples/smoke_test.c` verifies that custom user components propagate through internal collections via the component superset feature.
+`examples/smoke_test.c` verifies that custom user components propagate through internal collections.
 
 ## Known limitations
 
 - No TLS support.
 - IPv4 only.
-- Single sio context per process (global destructor pointer).
 
 ## License
 

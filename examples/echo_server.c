@@ -68,29 +68,27 @@ static void *worker_fn(void *arg) {
     return NULL;
   }
 
-  /* Phase 2: create user-owned result collections */
-  shift_collection_id_t connection_results_coll;
+  /* Phase 2: create user-owned collections */
+  shift_collection_id_t connections_coll;
   {
-    shift_component_id_t    comps[] = {comp_ids.conn_entity};
-    shift_collection_info_t info    = {.name = "connection_results", .comp_ids = comps, .comp_count = 1};
-    shift_collection_register(sh, &info, &connection_results_coll);
+    shift_component_id_t    comps[] = {comp_ids.fd, comp_ids.read_cycle_entity};
+    shift_collection_info_t info    = {.name = "connections", .comp_ids = comps, .comp_count = 2};
+    shift_collection_register(sh, &info, &connections_coll);
   }
 
   shift_collection_id_t read_results_coll;
   {
     shift_component_id_t comps[] = {comp_ids.read_buf, comp_ids.io_result,
-                                    comp_ids.conn_entity,
-                                    comp_ids.user_conn_entity};
-    shift_collection_info_t info = {.name = "read_results", .comp_ids = comps, .comp_count = 4};
+                                    comp_ids.conn_entity};
+    shift_collection_info_t info = {.name = "read_results", .comp_ids = comps, .comp_count = 3};
     shift_collection_register(sh, &info, &read_results_coll);
   }
 
   shift_collection_id_t write_results_coll;
   {
     shift_component_id_t comps[] = {comp_ids.write_buf, comp_ids.io_result,
-                                    comp_ids.conn_entity,
-                                    comp_ids.user_conn_entity};
-    shift_collection_info_t info = {.name = "write_results", .comp_ids = comps, .comp_count = 4};
+                                    comp_ids.conn_entity};
+    shift_collection_info_t info = {.name = "write_results", .comp_ids = comps, .comp_count = 3};
     shift_collection_register(sh, &info, &write_results_coll);
   }
 
@@ -109,10 +107,9 @@ static void *worker_fn(void *arg) {
       .buf_size           = BUF_SIZE,
       .max_connections    = MAX_CONNECTIONS,
       .ring_entries       = 4096,
-      .connection_results = connection_results_coll,
-      .read_results       = read_results_coll,
-      .write_results      = write_results_coll,
-      .auto_destroy_user_entity = false,
+      .connections         = connections_coll,
+      .read_results        = read_results_coll,
+      .write_results       = write_results_coll,
       .ring_params        = &ring_params,
   };
   if (sio_context_create(&sio_cfg, &ctx) != sio_ok) {
@@ -142,12 +139,11 @@ static void *worker_fn(void *arg) {
 
     /* Process read_results: echo back or handle close */
     {
-      shift_entity_t         *ro_entities = NULL;
-      sio_read_buf_t         *ro_rbufs    = NULL;
-      sio_io_result_t        *ro_results  = NULL;
-      sio_conn_entity_t      *ro_conns    = NULL;
-      sio_user_conn_entity_t *ro_uconns   = NULL;
-      size_t                  ro_count    = 0;
+      shift_entity_t    *ro_entities = NULL;
+      sio_read_buf_t    *ro_rbufs    = NULL;
+      sio_io_result_t   *ro_results  = NULL;
+      sio_conn_entity_t *ro_conns    = NULL;
+      size_t             ro_count    = 0;
 
       shift_collection_get_entities(sh, read_results_coll, &ro_entities,
                                     &ro_count);
@@ -160,17 +156,12 @@ static void *worker_fn(void *arg) {
       shift_collection_get_component_array(sh, read_results_coll,
                                            comp_ids.conn_entity,
                                            (void **)&ro_conns, NULL);
-      shift_collection_get_component_array(sh, read_results_coll,
-                                           comp_ids.user_conn_entity,
-                                           (void **)&ro_uconns, NULL);
 
       for (size_t i = 0; i < ro_count; i++) {
         if (ro_results[i].error != 0 || ro_rbufs[i].len == 0) {
           shift_entity_destroy_one(sh, ro_entities[i]);
           if (!shift_entity_is_stale(sh, ro_conns[i].entity))
             shift_entity_destroy_one(sh, ro_conns[i].entity);
-          if (!shift_entity_is_stale(sh, ro_uconns[i].entity))
-            shift_entity_destroy_one(sh, ro_uconns[i].entity);
           continue;
         }
 
@@ -185,11 +176,6 @@ static void *worker_fn(void *arg) {
         shift_entity_get_component(sh, wi_entity, comp_ids.conn_entity,
                                    (void **)&wi_ce);
         wi_ce->entity = ro_conns[i].entity;
-
-        sio_user_conn_entity_t *wi_uce = NULL;
-        shift_entity_get_component(sh, wi_entity, comp_ids.user_conn_entity,
-                                   (void **)&wi_uce);
-        wi_uce->entity = ro_uconns[i].entity;
 
         sio_write_buf_t *wi_wb = NULL;
         shift_entity_get_component(sh, wi_entity, comp_ids.write_buf,

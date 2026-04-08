@@ -49,20 +49,6 @@ static inline shift_entity_t sio_ud_entity(uint64_t ud) {
 }
 
 /* --------------------------------------------------------------------------
- * Internal component types (not exposed to users)
- * -------------------------------------------------------------------------- */
-
-typedef struct {
-  int fd; /* fixed-file slot index */
-} sio_fd_t;
-
-/* Stored on connections entities to track the associated read-cycle entity
- * for cleanup in the on_leave callback. */
-typedef struct {
-  shift_entity_t entity;
-} sio_read_cycle_entity_t;
-
-/* --------------------------------------------------------------------------
  * Internal context
  * -------------------------------------------------------------------------- */
 
@@ -77,26 +63,22 @@ struct sio_context {
   uint32_t                  max_connections;
   int                       listen_fd; /* -1 if not listening */
   sio_component_ids_t       comp_ids;
-  sio_collection_ids_t      coll_ids;  /* connections, read_in, write_in */
-  /* Internal-only component IDs (not exposed via sio_component_ids_t) */
-  shift_component_id_t      comp_fd;
-  shift_component_id_t      comp_read_cycle_entity;
-  /* User-provided result collections */
-  shift_collection_id_t     coll_connection_results;
+  sio_collection_ids_t      coll_ids;  /* read_in, write_in */
+  /* User-provided collections */
+  shift_collection_id_t     coll_connections;
   shift_collection_id_t     coll_read_results;
   shift_collection_id_t     coll_write_results;
   /* Internal collections */
   shift_collection_id_t     coll_read_pending; /* recv armed, waiting for data */
   shift_collection_id_t     coll_write_pending;/* send SQE submitted, waiting for CQE */
   shift_collection_id_t     coll_write_retry;  /* partial send, retried next poll */
-  bool                      auto_destroy_user_entity;
   /* Batched fixed-file slot releases — flushed at the top of sio_poll */
   uint32_t                 *pending_releases;      /* slot indices, size max_connections */
   uint32_t                  pending_release_count;
   int                      *release_minus_one;     /* all-(-1) scratch, size max_connections */
   /* Outbound connection support */
   bool                      has_connect;
-  shift_collection_id_t     coll_connect_results;
+  shift_collection_id_t     coll_connect_errors;
   shift_collection_id_t     coll_connect_socket_pending;
   shift_collection_id_t     coll_connect_pending;
 };
