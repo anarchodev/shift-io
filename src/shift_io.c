@@ -85,6 +85,24 @@ static void read_buf_destructor(shift_t *sh, shift_collection_id_t col_id,
 }
 
 /* --------------------------------------------------------------------------
+ * read_cycle_entity component constructor
+ * Initialise to a stale sentinel so the destructor is safe even if the
+ * entity is destroyed before a read-cycle entity is assigned (e.g. connect
+ * error paths).
+ * -------------------------------------------------------------------------- */
+
+static void read_cycle_entity_constructor(shift_t *sh,
+                                          shift_collection_id_t col_id,
+                                          const shift_entity_t *entities,
+                                          void *data, uint32_t offset,
+                                          uint32_t count, void *user_data) {
+  (void)sh; (void)col_id; (void)entities; (void)user_data;
+  sio_read_cycle_entity_t *rces = (sio_read_cycle_entity_t *)data + offset;
+  for (uint32_t i = 0; i < count; i++)
+    rces[i].entity = (shift_entity_t){.index = UINT32_MAX, .generation = 0};
+}
+
+/* --------------------------------------------------------------------------
  * read_cycle_entity component destructor
  * When a connection entity is destroyed, this destructor cleans up the
  * associated read-cycle entity.
@@ -247,6 +265,7 @@ sio_result_t sio_register_components(shift_t *sh, sio_component_ids_t *out) {
 
   shift_component_info_t rce_info = {
       .element_size = sizeof(sio_read_cycle_entity_t),
+      .constructor  = read_cycle_entity_constructor,
       .destructor   = read_cycle_entity_destructor,
   };
   if (shift_component_register(sh, &rce_info, &out->read_cycle_entity) !=
